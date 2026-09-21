@@ -72,14 +72,18 @@ class MTEngine:
                 low_cpu_mem_usage=True,
             )
             self.model.eval()
+            # google/madlad400-3b-mt: decoder_start=0, pad=1, eos=2 (not vanilla T5 0/1).
+            self.tokenizer.pad_token_id = self.model.config.pad_token_id
+            self.tokenizer.eos_token_id = self.model.config.eos_token_id
             self._ready = True
             tag_ids = self.tokenizer.encode("<2en>", add_special_tokens=False)
             logger.info(
-                "MADLAD-400 3B MT ready (%s) vocab=%s pad=%s eos=%s <2en>=%s",
+                "MADLAD-400 3B MT ready (%s) vocab=%s pad=%s eos=%s start=%s <2en>=%s",
                 self._vram_log(),
                 getattr(self.tokenizer, "vocab_size", None),
-                self.tokenizer.pad_token_id,
-                self.tokenizer.eos_token_id,
+                self.model.config.pad_token_id,
+                self.model.config.eos_token_id,
+                self.model.config.decoder_start_token_id,
                 tag_ids,
             )
         except Exception as exc:
@@ -158,11 +162,10 @@ class MTEngine:
             "length_penalty": length_penalty,
             "early_stopping": True,
             "do_sample": False,
+            "decoder_start_token_id": self.model.config.decoder_start_token_id,
+            "pad_token_id": self.model.config.pad_token_id,
+            "eos_token_id": self.model.config.eos_token_id,
         }
-        if self.tokenizer.pad_token_id is not None:
-            generate_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
-        if self.tokenizer.eos_token_id is not None:
-            generate_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
 
         outputs = self.model.generate(**enc, **generate_kwargs)
         decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
