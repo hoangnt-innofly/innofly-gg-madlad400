@@ -22,8 +22,8 @@ class Settings(BaseSettings):
 
     mt_mock: bool = False
     mt_model_id: str = "google/madlad400-3b-mt"
-    mt_device_map: str = "auto"
-    mt_dtype: str = "auto"
+    mt_device_map: str = "cuda:0"
+    mt_dtype: str = "bfloat16"
     # After each job, park weights in RAM so the 12GB card is free for LTX/TTS/Comfy.
     # Translate still runs on GPU. Set 0 only if MT owns the GPU.
     mt_free_vram: bool = True

@@ -47,25 +47,29 @@ class MTEngine:
         from transformers import T5ForConditionalGeneration, T5Tokenizer
 
         self.free_vram = self.free_vram and torch.cuda.is_available()
-        device_map = self._resolve_device_map(torch)
-        dtype = self._resolve_dtype(torch, device_map)
+        device = self._resolve_device(torch)
+        dtype = self._resolve_dtype(torch, device)
         self._patch_t5_tied_weights()
 
         logger.info(
-            "Loading %s (transformers=%s, device_map=%s, dtype=%s, free_vram=%s)",
+            "Loading %s (transformers=%s, device=%s, dtype=%s, free_vram=%s)",
             self.model_id,
             transformers.__version__,
-            device_map,
-            dtype if dtype is not None else "auto/fp32",
+            device,
+            dtype,
             self.free_vram,
         )
         try:
-            # Same classes/call pattern as the google/madlad400-3b-mt card.
+            # Do not use device_map="auto": T5 tied embeddings stay on the meta
+            # device and later .cpu()/.to() raise "Cannot copy out of meta tensor".
+            # 3B fp32 also does not fit the shared 12GB card.
             self.tokenizer = T5Tokenizer.from_pretrained(self.model_id)
-            load_kwargs: dict = {"device_map": device_map}
-            if dtype is not None:
-                load_kwargs["torch_dtype"] = dtype
-            self.model = T5ForConditionalGeneration.from_pretrained(self.model_id, **load_kwargs)
+            self.model = T5ForConditionalGeneration.from_pretrained(
+                self.model_id,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=False,
+            )
+            self.model.to(device)
             self.model.eval()
             probe = self.tokenizer.encode("<2en> ok", add_special_tokens=True)
             probe_tokens = self.tokenizer.convert_ids_to_tokens(probe)
@@ -145,7 +149,7 @@ class MTEngine:
         for chunk in batch:
             text = f"<2{target_language}> {chunk}"
             # Same as the Hub card: tokenizer(text).input_ids.to(model.device)
-            input_ids = self.tokenizer(text, return_tensors="pt").input_ids.to(self.model.device)
+            input_ids = self.tokenizer(text, return_tensors="pt").input_ids.to(self._device())
             src_len = int(input_ids.shape[-1])
             gen_kwargs: dict = {
                 "input_ids": input_ids,
@@ -279,9 +283,17 @@ class MTEngine:
         import torch
         import transformers
 
-        encoder = self.model.get_encoder().embed_tokens.weight.detach().float().cpu()
-        decoder = self.model.get_decoder().embed_tokens.weight.detach().float().cpu()
-        lm_head = self.model.lm_head.weight.detach().float().cpu()
+        encoder_w = self.model.get_encoder().embed_tokens.weight
+        decoder_w = self.model.get_decoder().embed_tokens.weight
+        lm_w = self.model.lm_head.weight
+        if encoder_w.device.type == "meta" or decoder_w.device.type == "meta":
+            raise RuntimeError(
+                "MADLAD weights are still on the meta device. "
+                "Load without device_map='auto' (this engine now uses model.to(cuda))."
+            )
+        encoder = encoder_w.detach().float().cpu()
+        decoder = decoder_w.detach().float().cpu()
+        lm_head = lm_w.detach().float().cpu()
         enc_from_lm = torch.equal(encoder, lm_head)
         enc_from_dec = torch.equal(encoder, decoder)
         logger.info(
@@ -298,20 +310,17 @@ class MTEngine:
                 "Install transformers 4.57.x: pip install 'transformers>=4.44.0,<5'"
             )
 
-    def _resolve_device_map(self, torch) -> str:
+    def _resolve_device(self, torch) -> str:
         requested = (self.device_map or "auto").strip()
         if requested.startswith("cuda") and not torch.cuda.is_available():
             logger.warning("CUDA requested but unavailable; falling back to CPU")
             return "cpu"
-        # Keep "auto": the Hub card uses device_map="auto" (not a forced cuda:0).
         if requested in {"auto", "cuda"}:
-            return "auto" if torch.cuda.is_available() else "cpu"
+            return "cuda:0" if torch.cuda.is_available() else "cpu"
         return requested
 
-    def _resolve_dtype(self, torch, device_map: str):
+    def _resolve_dtype(self, torch, device: str):
         name = (self.dtype_name or "auto").lower().strip()
-        if name in {"", "auto", "none", "default"}:
-            return None
         mapping = {
             "bf16": torch.bfloat16,
             "bfloat16": torch.bfloat16,
@@ -320,14 +329,17 @@ class MTEngine:
             "fp32": torch.float32,
             "float32": torch.float32,
         }
+        if name in {"", "auto", "none", "default"}:
+            # fp32 3B (~12GB weights) does not fit the shared card; bf16 is ~6GB.
+            return torch.float32 if str(device) == "cpu" else torch.bfloat16
         dtype = mapping.get(name)
         if dtype is None:
-            logger.warning("Unknown MT_DTYPE=%s; using Hub default (fp32)", name)
-            return None
-        if str(device_map) == "cpu" and dtype in {torch.bfloat16, torch.float16}:
+            logger.warning("Unknown MT_DTYPE=%s; using bfloat16", name)
+            dtype = torch.bfloat16
+        if str(device) == "cpu" and dtype in {torch.bfloat16, torch.float16}:
             return torch.float32
         if dtype == torch.float16:
-            logger.warning("float16 T5 often emits garbage; Hub card uses default fp32")
+            logger.warning("float16 T5 is unstable; prefer bfloat16")
         return dtype
 
     @staticmethod
