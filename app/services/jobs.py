@@ -29,6 +29,7 @@ class Job:
     status: JobStatus = "queued"
     translation: str | None = None
     detected_language: str | None = None
+    model_id: str = "google/madlad400-3b-mt"
     chunks: int | None = None
     error: str | None = None
     progress: str = "queued"
@@ -46,7 +47,7 @@ class Job:
             "source_language": self.source_language,
             "target_language": self.target_language,
             "detected_language": self.detected_language,
-            "model": "google/madlad400-3b-mt",
+            "model": self.model_id,
             "mode": "mt",
             "num_beams": self.num_beams,
             "chunks": self.chunks,
@@ -106,6 +107,7 @@ class JobService:
             max_new_tokens=(
                 self.settings.mt_default_max_new_tokens if max_new_tokens is None else max_new_tokens
             ),
+            model_id=self.settings.mt_model_id,
         )
         self.jobs[job_id] = job
         self._queue.put_nowait(job_id)

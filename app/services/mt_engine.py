@@ -44,7 +44,7 @@ class MTEngine:
             return
 
         import torch
-        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        from transformers import T5ForConditionalGeneration, T5Tokenizer
 
         self.free_vram = self.free_vram and torch.cuda.is_available()
         device_map = self._resolve_device_map(torch)
@@ -54,26 +54,19 @@ class MTEngine:
             "Loading %s (device_map=%s, dtype=%s, free_vram=%s)",
             self.model_id,
             device_map,
-            dtype,
+            dtype if dtype is not None else "auto/fp32",
             self.free_vram,
         )
         try:
-            # extra_ids=0 + legacy=False match google/madlad400-3b-mt tokenizer_config.
-            # Default T5 extra_ids=100 shifts vocab → number/word salad.
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_id,
-                use_fast=False,
-                extra_ids=0,
-                legacy=False,
-            )
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                self.model_id,
-                torch_dtype=dtype,
-                device_map=device_map,
-                low_cpu_mem_usage=True,
-            )
+            # Same classes/call pattern as the google/madlad400-3b-mt and jbochi cards:
+            #   tokenizer = T5Tokenizer.from_pretrained(model_name)
+            #   model = T5ForConditionalGeneration.from_pretrained(model_name, device_map="auto")
+            self.tokenizer = T5Tokenizer.from_pretrained(self.model_id)
+            load_kwargs: dict = {"device_map": device_map}
+            if dtype is not None:
+                load_kwargs["torch_dtype"] = dtype
+            self.model = T5ForConditionalGeneration.from_pretrained(self.model_id, **load_kwargs)
             self.model.eval()
-            # Do not remap pad/eos: tokenizer already matches config (pad=<s>=1, eos=</s>=2, unk=0).
             probe = self.tokenizer.encode("<2en> ok", add_special_tokens=True)
             probe_tokens = self.tokenizer.convert_ids_to_tokens(probe)
             if "<2en>" not in probe_tokens:
@@ -147,32 +140,26 @@ class MTEngine:
     ) -> list[str]:
         import torch
 
-        prefixed = [f"<2{target_language}> {chunk}" for chunk in batch]
-        enc = self.tokenizer(
-            prefixed,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_input_tokens,
-            add_special_tokens=True,
-        )
-        enc = enc.to(self._device())
-        src_len = int(enc["input_ids"].shape[-1])
-        gen_tokens = min(max_new_tokens, max(48, src_len + 16))
-        # Official Hub usage: tokenizer("<2xx> text") then generate(**inputs).
-        # generation_config already has decoder_start=0, pad=1, eos=2.
-        outputs = self.model.generate(
-            **enc,
-            max_new_tokens=gen_tokens,
-            num_beams=max(1, min(num_beams, 5)),
-            length_penalty=length_penalty,
-            do_sample=False,
-        )
-        decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        del outputs, enc
+        decoded: list[str] = []
+        for chunk in batch:
+            text = f"<2{target_language}> {chunk}"
+            # Same as the Hub card: tokenizer(text).input_ids.to(model.device)
+            input_ids = self.tokenizer(text, return_tensors="pt").input_ids.to(self.model.device)
+            src_len = int(input_ids.shape[-1])
+            gen_kwargs: dict = {
+                "input_ids": input_ids,
+                "max_new_tokens": min(max_new_tokens, max(48, src_len + 16)),
+            }
+            if num_beams > 1:
+                gen_kwargs["num_beams"] = max(1, min(num_beams, 5))
+                gen_kwargs["length_penalty"] = length_penalty
+                gen_kwargs["do_sample"] = False
+            outputs = self.model.generate(**gen_kwargs)
+            decoded.append(self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip())
+            del outputs, input_ids
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return [item.strip() for item in decoded]
+        return decoded
 
     def _chunk_text(self, text: str) -> list[str]:
         """Pack paragraphs / sentences under the encoder limit to keep document context."""
@@ -268,17 +255,18 @@ class MTEngine:
 
     def _resolve_device_map(self, torch) -> str:
         requested = (self.device_map or "auto").strip()
-        if requested in {"auto", "cuda", "cuda:0"} and torch.cuda.is_available():
-            return "cuda:0"
         if requested.startswith("cuda") and not torch.cuda.is_available():
             logger.warning("CUDA requested but unavailable; falling back to CPU")
             return "cpu"
-        if requested == "auto":
-            return "cuda:0" if torch.cuda.is_available() else "cpu"
+        # Keep "auto": the Hub card uses device_map="auto" (not a forced cuda:0).
+        if requested in {"auto", "cuda"}:
+            return "auto" if torch.cuda.is_available() else "cpu"
         return requested
 
     def _resolve_dtype(self, torch, device_map: str):
-        name = (self.dtype_name or "bfloat16").lower()
+        name = (self.dtype_name or "auto").lower().strip()
+        if name in {"", "auto", "none", "default"}:
+            return None
         mapping = {
             "bf16": torch.bfloat16,
             "bfloat16": torch.bfloat16,
@@ -287,9 +275,14 @@ class MTEngine:
             "fp32": torch.float32,
             "float32": torch.float32,
         }
-        dtype = mapping.get(name, torch.bfloat16)
+        dtype = mapping.get(name)
+        if dtype is None:
+            logger.warning("Unknown MT_DTYPE=%s; using Hub default (fp32)", name)
+            return None
         if str(device_map) == "cpu" and dtype in {torch.bfloat16, torch.float16}:
             return torch.float32
+        if dtype == torch.float16:
+            logger.warning("float16 T5 often emits garbage; Hub card uses default fp32")
         return dtype
 
     @staticmethod
