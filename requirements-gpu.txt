@@ -1,0 +1,12 @@
+-r requirements.txt
+
+# Same CUDA 12 setup as the working LTX / Qwen3-TTS servers (cu121).
+# Install torch from that index first, then this file:
+#
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   python -m pip install -r requirements-gpu.txt
+
+transformers>=4.44.0
+accelerate>=0.34.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
