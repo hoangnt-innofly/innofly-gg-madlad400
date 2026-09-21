@@ -107,7 +107,7 @@ python scripts/download_models.py
 
 If you download weights locally, set `MT_MODEL_ID` to that folder, for example `models/madlad400-3b-mt`. Otherwise the Hugging Face id is used and weights download on first load.
 
-Port `8002` avoids colliding with TTS/LTX on `8000`. `MT_FREE_VRAM=1` unloads the 3B weights after each job so the shared 12GB card can run the other apps.
+Port `8002` avoids colliding with TTS/LTX on `8000`. Keep `MT_FREE_VRAM=0` so the 3B model stays on GPU — a few lines should translate in ~1–3s after the first load. Set `1` only when this process must free the 12GB card for LTX/TTS after every job (each request then reloads ~6GB and looks “stuck” on GET).
 
 ## Quality notes
 

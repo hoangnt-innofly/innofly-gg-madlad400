@@ -31,6 +31,7 @@ class Job:
     detected_language: str | None = None
     chunks: int | None = None
     error: str | None = None
+    progress: str = "queued"
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
     _done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
@@ -39,6 +40,7 @@ class Job:
         return {
             "job_id": self.id,
             "status": self.status,
+            "progress": self.progress,
             "text": self.text,
             "translation": self.translation,
             "source_language": self.source_language,
@@ -159,12 +161,15 @@ class JobService:
             job_id = await self._queue.get()
             job = self.jobs[job_id]
             job.status = "running"
+            job.progress = "starting"
             try:
                 await asyncio.to_thread(self._run_job, job)
                 job.status = "succeeded"
+                job.progress = "done"
             except Exception as exc:
                 logger.exception("Job %s failed", job_id)
                 job.status = "failed"
+                job.progress = "failed"
                 job.error = str(exc)
                 if exc.__cause__ and str(exc.__cause__) not in job.error:
                     job.error = f"{exc} | {exc.__cause__}"
@@ -175,6 +180,7 @@ class JobService:
                 self._queue.task_done()
 
     def _run_job(self, job: Job) -> None:
+        job.progress = "detecting_language"
         detected = detect_language(job.text)
         job.detected_language = detected
         if job.source_language == "auto":
@@ -183,6 +189,7 @@ class JobService:
         if job.source_language == job.target_language:
             job.translation = job.text
             job.chunks = 1
+            job.progress = "skipped_same_language"
             return
 
         if self.settings.mt_mock:
@@ -190,7 +197,9 @@ class JobService:
             job.chunks = 1
             return
 
+        job.progress = "loading_model"
         engine = self._get_engine()
+        job.progress = "translating"
         translation, chunks = engine.translate(
             text=job.text,
             target_language=job.target_language,
@@ -214,6 +223,7 @@ class JobService:
                     max_input_tokens=self.settings.mt_default_max_input_tokens,
                     batch_size=self.settings.mt_default_batch_size,
                 )
+            if not getattr(self._engine, "ready", False):
                 try:
                     self._engine.load()
                 except Exception:

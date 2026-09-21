@@ -16,6 +16,7 @@ class JobResponse(BaseModel):
     num_beams: int | None = None
     chunks: int | None = None
     error: str | None = None
+    progress: str | None = None
 
 
 class HealthResponse(BaseModel):

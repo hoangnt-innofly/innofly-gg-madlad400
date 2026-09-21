@@ -302,6 +302,7 @@
         statusEl.textContent =
           "Job " + id +
           "\ntrạng thái: " + job.status +
+          (job.progress ? " · " + job.progress : "") +
           "\n" + job.source_language + " → " + job.target_language;
         if (job.status === "succeeded" || job.status === "failed") return job;
         await new Promise((r) => setTimeout(r, 800));
