@@ -32,6 +32,7 @@ class MTEngine:
         self.batch_size = max(1, batch_size)
         self.model = None
         self.tokenizer = None
+        self.sp = None
         self._ready = False
 
     @property
@@ -72,23 +73,33 @@ class MTEngine:
                 low_cpu_mem_usage=True,
             )
             self.model.eval()
+            import sentencepiece as spm
+
+            vocab_file = getattr(self.tokenizer, "vocab_file", None)
+            if not vocab_file:
+                raise RuntimeError("MADLAD tokenizer has no SentencePiece vocab_file")
+            self.sp = spm.SentencePieceProcessor()
+            if not self.sp.load(str(vocab_file)):
+                raise RuntimeError(f"Failed to load SentencePiece model {vocab_file}")
             # google/madlad400-3b-mt: decoder_start=0, pad=1, eos=2 (not vanilla T5 0/1).
             self.tokenizer.pad_token_id = self.model.config.pad_token_id
             self.tokenizer.eos_token_id = self.model.config.eos_token_id
+            tag_id = self._language_tag_id("en")
             self._ready = True
-            tag_ids = self.tokenizer.encode("<2en>", add_special_tokens=False)
             logger.info(
-                "MADLAD-400 3B MT ready (%s) vocab=%s pad=%s eos=%s start=%s <2en>=%s",
+                "MADLAD-400 3B MT ready (%s) pad=%s eos=%s start=%s <2en>=%s/%s",
                 self._vram_log(),
-                getattr(self.tokenizer, "vocab_size", None),
                 self.model.config.pad_token_id,
                 self.model.config.eos_token_id,
                 self.model.config.decoder_start_token_id,
-                tag_ids,
+                tag_id,
+                self.sp.id_to_piece(tag_id),
             )
         except Exception as exc:
             self.model = None
             self.tokenizer = None
+            self.sp = None
+            self._ready = False
             self._free_cuda()
             raise RuntimeError(
                 f"Failed to load MADLAD model {self.model_id}: {type(exc).__name__}: {exc}"
@@ -144,35 +155,25 @@ class MTEngine:
     ) -> list[str]:
         import torch
 
-        prefixed = [f"<2{target_language}> {chunk}" for chunk in batch]
-        enc = self.tokenizer(
-            prefixed,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_input_tokens,
-        )
-        enc = enc.to(self._device())
+        enc = self._encode_madlad(batch, target_language)
         src_len = int(enc["input_ids"].shape[-1])
         gen_tokens = min(max_new_tokens, max(64, src_len + 32))
-
-        generate_kwargs: dict[str, Any] = {
-            "max_new_tokens": gen_tokens,
-            "num_beams": max(1, min(num_beams, 5)),
-            "length_penalty": length_penalty,
-            "early_stopping": True,
-            "do_sample": False,
-            "decoder_start_token_id": self.model.config.decoder_start_token_id,
-            "pad_token_id": self.model.config.pad_token_id,
-            "eos_token_id": self.model.config.eos_token_id,
-        }
-
-        outputs = self.model.generate(**enc, **generate_kwargs)
-        decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        outputs = self.model.generate(
+            **enc,
+            max_new_tokens=gen_tokens,
+            num_beams=max(1, min(num_beams, 5)),
+            length_penalty=length_penalty,
+            early_stopping=True,
+            do_sample=False,
+            decoder_start_token_id=self.model.config.decoder_start_token_id,
+            pad_token_id=self.model.config.pad_token_id,
+            eos_token_id=self.model.config.eos_token_id,
+        )
+        decoded = self._decode_madlad(outputs)
         del outputs, enc
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return [item.strip() for item in decoded]
+        return decoded
 
     def _chunk_text(self, text: str) -> list[str]:
         """Pack paragraphs / sentences under the encoder limit to keep document context."""
@@ -184,7 +185,7 @@ class MTEngine:
             stripped = block.strip()
             if not stripped:
                 continue
-            if self._token_len(f"<2xx> {stripped}") <= self.max_input_tokens:
+            if self._token_len(stripped) <= self.max_input_tokens:
                 chunks.append(stripped)
                 continue
             packed = self._pack_sentences(stripped)
@@ -201,12 +202,12 @@ class MTEngine:
         prefix_budget = self.max_input_tokens
         for sentence in sentences:
             candidate = sentence if not current else f"{current} {sentence}"
-            if self._token_len(f"<2xx> {candidate}") <= prefix_budget:
+            if self._token_len(candidate) <= prefix_budget:
                 current = candidate
                 continue
             if current:
                 packed.append(current)
-            if self._token_len(f"<2xx> {sentence}") <= prefix_budget:
+            if self._token_len(sentence) <= prefix_budget:
                 current = sentence
             else:
                 packed.extend(self._hard_split(sentence))
@@ -223,7 +224,7 @@ class MTEngine:
         current: list[str] = []
         for word in words:
             candidate = " ".join(current + [word])
-            if current and self._token_len(f"<2xx> {candidate}") > self.max_input_tokens:
+            if current and self._token_len(candidate) > self.max_input_tokens:
                 pieces.append(" ".join(current))
                 current = [word]
             else:
@@ -233,7 +234,58 @@ class MTEngine:
         return pieces
 
     def _token_len(self, text: str) -> int:
-        return len(self.tokenizer.encode(text, add_special_tokens=False))
+        return 2 + len(self.sp.encode(text, out_type=int))
+
+    def _language_tag_id(self, target_language: str) -> int:
+        tag = f"<2{target_language}>"
+        tag_id = int(self.sp.piece_to_id(tag))
+        unk = int(self.sp.unk_id())
+        piece = self.sp.id_to_piece(tag_id) if tag_id >= 0 else ""
+        if tag_id not in {unk, -1} and piece == tag:
+            return tag_id
+        encoded = list(self.sp.encode(tag, out_type=int))
+        if len(encoded) == 1 and encoded[0] != unk:
+            return int(encoded[0])
+        raise RuntimeError(
+            f"MADLAD vocab missing language tag {tag} (id={tag_id}, piece={piece!r}, encoded={encoded})"
+        )
+
+    def _encode_madlad(self, batch: list[str], target_language: str) -> dict[str, Any]:
+        import torch
+
+        tag_id = self._language_tag_id(target_language)
+        eos = int(self.model.config.eos_token_id)
+        pad = int(self.model.config.pad_token_id)
+        rows: list[list[int]] = []
+        for chunk in batch:
+            ids = [tag_id, *self.sp.encode(chunk, out_type=int)]
+            if not ids or ids[-1] != eos:
+                ids.append(eos)
+            rows.append(ids[: self.max_input_tokens])
+        max_len = max(len(row) for row in rows)
+        input_ids: list[list[int]] = []
+        attention_mask: list[list[int]] = []
+        for ids in rows:
+            pad_n = max_len - len(ids)
+            input_ids.append(ids + [pad] * pad_n)
+            attention_mask.append([1] * len(ids) + [0] * pad_n)
+        device = self._device()
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long, device=device),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long, device=device),
+        }
+
+    def _decode_madlad(self, outputs) -> list[str]:
+        skip = {
+            int(self.model.config.pad_token_id),
+            int(self.model.config.eos_token_id),
+            int(self.model.config.decoder_start_token_id),
+        }
+        texts: list[str] = []
+        for row in outputs.tolist():
+            ids = [int(token) for token in row if int(token) not in skip]
+            texts.append(self.sp.decode(ids).strip())
+        return texts
 
     @staticmethod
     def _rejoin(original: str, translations: list[str]) -> str:
@@ -251,6 +303,7 @@ class MTEngine:
         """Drop the GPU model so Comfy/LTX/TTS can use the 12GB card (reload on next job)."""
         self.model = None
         self.tokenizer = None
+        self.sp = None
         self._ready = False
         self._free_cuda()
         logger.info("Unloaded MADLAD from GPU (%s)", self._vram_log())
