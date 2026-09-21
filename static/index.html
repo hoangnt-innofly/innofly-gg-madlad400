@@ -262,25 +262,19 @@
       btn.disabled = true;
       outEl.value = "";
       countChars();
-      statusEl.textContent = "Đang xếp hàng dịch máy…";
+      statusEl.textContent = "Đang dịch… (chờ bản dịch trong cùng một request)";
       const data = new FormData(form);
       try {
-        const res = await fetch("/api/v1/jobs", { method: "POST", body: data, headers: apiHeaders() });
+        const res = await fetch("/api/v1/translate", { method: "POST", body: data, headers: apiHeaders() });
         const job = await res.json();
         if (!res.ok) throw new Error(job.detail || JSON.stringify(job));
-        statusEl.textContent =
-          "Đã xếp hàng " + job.job_id +
-          "\n" + job.source_language + " → " + job.target_language +
-          " · beams " + job.num_beams +
-          "\nĐang chờ bản dịch…";
-        const done = await poll(job.job_id);
-        if (done.status !== "succeeded") throw new Error(done.error || done.status);
-        outEl.value = done.translation || "";
+        if (job.status !== "succeeded") throw new Error(job.error || job.status);
+        outEl.value = job.translation || "";
         countChars();
         statusEl.textContent =
-          "Xong.\n" + done.source_language + " → " + done.target_language +
-          (done.detected_language ? " · nhận diện " + done.detected_language : "") +
-          (done.chunks ? " · " + done.chunks + " đoạn" : "");
+          "Xong.\n" + job.source_language + " → " + job.target_language +
+          (job.detected_language ? " · nhận diện " + job.detected_language : "") +
+          (job.chunks ? " · " + job.chunks + " đoạn" : "");
       } catch (err) {
         statusEl.textContent = "Lỗi: " + err.message;
       } finally {
@@ -294,20 +288,6 @@
         form.requestSubmit();
       }
     });
-
-    async function poll(id) {
-      while (true) {
-        const res = await fetch(`/api/v1/jobs/${id}`, { headers: apiHeaders() });
-        const job = await res.json();
-        statusEl.textContent =
-          "Job " + id +
-          "\ntrạng thái: " + job.status +
-          (job.progress ? " · " + job.progress : "") +
-          "\n" + job.source_language + " → " + job.target_language;
-        if (job.status === "succeeded" || job.status === "failed") return job;
-        await new Promise((r) => setTimeout(r, 800));
-      }
-    }
   </script>
 </body>
 </html>

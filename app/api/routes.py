@@ -35,6 +35,16 @@ def to_response(request: Request, job) -> JobResponse:
     return JobResponse.model_validate(job.to_public(public_base(request)))
 
 
+async def _await_job(job, timeout: float = 600):
+    try:
+        job = await jobs.wait(job.id, timeout=timeout)
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        raise HTTPException(status_code=504, detail="Translation timed out") from exc
+    if job.status == "failed":
+        raise HTTPException(status_code=500, detail=job.error or "Translation failed")
+    return job
+
+
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     cuda_available, device_name = jobs.cuda_info()
@@ -96,19 +106,14 @@ async def translate(
     max_new_tokens: Annotated[Optional[int], Form()] = None,
     wait: Annotated[bool, Form()] = True,
 ) -> JobResponse:
-    """Machine translation with MADLAD-400 3B. Waits for translation by default."""
+    """Machine translation with MADLAD-400 3B. Waits and returns translation."""
     job = await _enqueue(text, source_language, target_language, num_beams, length_penalty, max_new_tokens)
     if wait:
-        try:
-            job = await jobs.wait(job.id, timeout=600)
-        except (TimeoutError, asyncio.TimeoutError) as exc:
-            raise HTTPException(status_code=504, detail="Translation timed out") from exc
-        if job.status == "failed":
-            raise HTTPException(status_code=500, detail=job.error or "Translation failed")
+        job = await _await_job(job)
     return to_response(request, job)
 
 
-@api.post("/jobs", response_model=JobResponse, status_code=202)
+@api.post("/jobs", response_model=JobResponse)
 async def create_job(
     request: Request,
     text: Annotated[str, Form(min_length=1)],
@@ -118,8 +123,9 @@ async def create_job(
     length_penalty: Annotated[Optional[float], Form()] = None,
     max_new_tokens: Annotated[Optional[int], Form()] = None,
 ) -> JobResponse:
-    """Queue a translation job and return immediately. Poll GET /api/v1/jobs/{job_id}."""
+    """Same as /translate: wait until done, then return translation."""
     job = await _enqueue(text, source_language, target_language, num_beams, length_penalty, max_new_tokens)
+    job = await _await_job(job)
     return to_response(request, job)
 
 

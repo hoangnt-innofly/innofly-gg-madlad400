@@ -2,7 +2,7 @@
 
 FastAPI backend for multilingual **machine translation** with [MADLAD-400](https://huggingface.co/google/madlad400-3b-mt) **`google/madlad400-3b-mt`**.
 
-Submit source text + target language. Response includes `translation`.
+Submit source text + target language. One request waits and returns `translation`.
 
 ## Model (mt)
 
@@ -21,9 +21,9 @@ MADLAD only needs the **target** language tag (`<2vi>`, `<2en>`, `<2zh>`). Sourc
 
 | Method | Path | What it does |
 | --- | --- | --- |
-| `POST` | `/api/v1/translate` | Form MT, **wait**, return `translation` |
-| `POST` | `/api/v1/jobs` | Same form, return immediately (`202`) |
-| `GET` | `/api/v1/jobs/{job_id}` | Poll until `status=succeeded` and `translation` is set |
+| `POST` | `/api/v1/translate` | Form MT, wait, return `translation` |
+| `POST` | `/api/v1/jobs` | Same as `/translate` (waits for text) |
+| `GET` | `/api/v1/jobs/{job_id}` | Optional lookup of a finished job |
 | `GET` | `/api/v1/languages` | Language list for the form |
 | `POST` | `/api/v1/detect` | Detect source language |
 | `POST` | `/api/v1/free-memory` | Park weights off GPU (same idea as Comfy `free_memory`) |
@@ -107,7 +107,7 @@ python scripts/download_models.py
 
 If you download weights locally, set `MT_MODEL_ID` to that folder, for example `models/madlad400-3b-mt`. Otherwise the Hugging Face id is used and weights download on first load.
 
-Port `8002` avoids colliding with TTS/LTX on `8000`. Keep `MT_FREE_VRAM=0` so the 3B model stays on GPU — a few lines should translate in ~1–3s after the first load. Set `1` only when this process must free the 12GB card for LTX/TTS after every job (each request then reloads ~6GB and looks “stuck” on GET).
+Port `8002` avoids colliding with TTS/LTX on `8000`. Keep `MT_FREE_VRAM=0` so the 3B model stays on GPU — a few lines should translate in ~1–3s after the first load. Set `1` only when this process must free the 12GB card for LTX/TTS after every job (each request then reloads ~6GB).
 
 ## Quality notes
 
