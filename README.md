@@ -27,8 +27,20 @@ MADLAD only needs the **target** language tag (`<2vi>`, `<2en>`, `<2zh>`). Sourc
 | `GET` | `/api/v1/languages` | Language list for the form |
 | `POST` | `/api/v1/detect` | Detect source language |
 | `POST` | `/api/v1/free-memory` | Park weights off GPU (same idea as Comfy `free_memory`) |
-| `GET` | `/health` | CUDA / mock / defaults |
+| `GET` | `/health` | CUDA / mock / defaults (no API key) |
 | `GET` | `/docs` | Swagger |
+
+All `/api/v1/*` routes require header `api-key` equal to `SECRET_API_KEY`. Missing or wrong key → `401`.
+
+Example (sync — response includes `translation`):
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8002/api/v1/translate" `
+  -H "api-key: change-me" `
+  -F "text=Xin chào, đây là MADLAD-400. Dịch sang tiếng Anh giúp tôi." `
+  -F "source_language=auto" `
+  -F "target_language=en"
+```
 
 Multipart fields:
 
@@ -40,15 +52,6 @@ Multipart fields:
 | `num_beams` | no | `1`–`8`, default `4` |
 | `length_penalty` | no | Default `1.0` |
 | `max_new_tokens` | no | Per chunk, default `512` |
-
-Example (sync — response includes `translation`):
-
-```powershell
-curl.exe -X POST "http://127.0.0.1:8002/api/v1/translate" `
-  -F "text=Xin chào, đây là MADLAD-400. Dịch sang tiếng Anh giúp tôi." `
-  -F "source_language=auto" `
-  -F "target_language=en"
-```
 
 ```json
 {

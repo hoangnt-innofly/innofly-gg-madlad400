@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8002
     public_base_url: str = "http://127.0.0.1:8002"
+    secret_api_key: str = ""
 
     mt_mock: bool = False
     mt_model_id: str = "google/madlad400-3b-mt"

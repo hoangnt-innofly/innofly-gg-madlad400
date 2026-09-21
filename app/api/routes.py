@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 
+from app.core.auth import require_api_key
 from app.core.config import get_settings
 from app.core.languages import (
     LANGUAGES,
@@ -16,6 +17,7 @@ from app.models.schemas import DetectResponse, HealthResponse, JobResponse, Lang
 from app.services.jobs import JobService
 
 router = APIRouter()
+api = APIRouter(prefix="/api/v1", dependencies=[Depends(require_api_key)])
 settings = get_settings()
 jobs = JobService(settings)
 
@@ -58,12 +60,12 @@ def health() -> HealthResponse:
     )
 
 
-@router.get("/api/v1/languages", response_model=LanguagesResponse)
+@api.get("/languages", response_model=LanguagesResponse)
 def list_languages() -> LanguagesResponse:
     return LanguagesResponse.model_validate(languages_payload())
 
 
-@router.post("/api/v1/detect", response_model=DetectResponse)
+@api.post("/detect", response_model=DetectResponse)
 def detect_source_language(text: Annotated[str, Form(min_length=1)]) -> DetectResponse:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -77,13 +79,13 @@ def detect_source_language(text: Annotated[str, Form(min_length=1)]) -> DetectRe
     )
 
 
-@router.post("/api/v1/free-memory")
+@api.post("/free-memory")
 def free_memory() -> dict:
     """Release MADLAD VRAM after use so other 12GB-card apps (Comfy, LTX, TTS) can run."""
     return jobs.free_vram()
 
 
-@router.post("/api/v1/translate", response_model=JobResponse)
+@api.post("/translate", response_model=JobResponse)
 async def translate(
     request: Request,
     text: Annotated[str, Form(min_length=1)],
@@ -106,7 +108,7 @@ async def translate(
     return to_response(request, job)
 
 
-@router.post("/api/v1/jobs", response_model=JobResponse, status_code=202)
+@api.post("/jobs", response_model=JobResponse, status_code=202)
 async def create_job(
     request: Request,
     text: Annotated[str, Form(min_length=1)],
@@ -121,7 +123,7 @@ async def create_job(
     return to_response(request, job)
 
 
-@router.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
+@api.get("/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str, request: Request) -> JobResponse:
     job = jobs.get(job_id)
     if job is None:

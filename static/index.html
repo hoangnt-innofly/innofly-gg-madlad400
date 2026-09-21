@@ -57,6 +57,9 @@
       API: <a class="docs" href="/docs">/docs</a>
     </p>
     <form id="form">
+      <label for="api_key">API key (header api-key)</label>
+      <input type="password" id="api_key" autocomplete="off" placeholder="Trùng SECRET_API_KEY trên server" />
+      <p class="hint">Mọi gọi /api/v1/* đều gửi header <code>api-key</code>. Key lưu tạm trong trình duyệt.</p>
       <div class="panes">
         <div>
           <div class="pane-head">
@@ -139,8 +142,20 @@
     const detectedEl = document.getElementById("detected");
     const srcCount = document.getElementById("src-count");
     const tgtCount = document.getElementById("tgt-count");
+    const apiKeyEl = document.getElementById("api_key");
     let languages = FALLBACK;
     let detectTimer = null;
+
+    apiKeyEl.value = sessionStorage.getItem("madlad_api_key") || "";
+    apiKeyEl.addEventListener("change", () => {
+      sessionStorage.setItem("madlad_api_key", apiKeyEl.value.trim());
+    });
+
+    function apiHeaders() {
+      const key = (apiKeyEl.value || "").trim();
+      sessionStorage.setItem("madlad_api_key", key);
+      return key ? { "api-key": key } : {};
+    }
 
     function optionLabel(lang) {
       return lang.name_vi ? `${lang.name_vi} (${lang.code})` : lang.code;
@@ -178,7 +193,7 @@
       try {
         const data = new FormData();
         data.set("text", text);
-        const res = await fetch("/api/v1/detect", { method: "POST", body: data });
+        const res = await fetch("/api/v1/detect", { method: "POST", body: data, headers: apiHeaders() });
         if (!res.ok) return;
         const info = await res.json();
         const name = info.name_vi || langName(info.language);
@@ -192,7 +207,7 @@
     fillSelects();
     countChars();
 
-    fetch("/api/v1/languages")
+    fetch("/api/v1/languages", { headers: apiHeaders() })
       .then((res) => res.ok ? res.json() : null)
       .then((data) => { if (data?.languages) fillSelects(data.languages); })
       .catch(() => {});
@@ -250,7 +265,7 @@
       statusEl.textContent = "Đang xếp hàng dịch máy…";
       const data = new FormData(form);
       try {
-        const res = await fetch("/api/v1/jobs", { method: "POST", body: data });
+        const res = await fetch("/api/v1/jobs", { method: "POST", body: data, headers: apiHeaders() });
         const job = await res.json();
         if (!res.ok) throw new Error(job.detail || JSON.stringify(job));
         statusEl.textContent =
@@ -282,7 +297,7 @@
 
     async function poll(id) {
       while (true) {
-        const res = await fetch(`/api/v1/jobs/${id}`);
+        const res = await fetch(`/api/v1/jobs/${id}`, { headers: apiHeaders() });
         const job = await res.json();
         statusEl.textContent =
           "Job " + id +
