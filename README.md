@@ -94,10 +94,9 @@ Open http://127.0.0.1:8002 — submit text, get a tagged placeholder translation
 
 ### B. Real MADLAD-400 3B MT
 
-Same CUDA 12 wheels as the working LTX / TTS setup (`cu121`):
+Same CUDA 12 wheels as the working LTX / TTS setup (`cu121`). One file installs torch + transformers:
 
 ```powershell
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
 python -m pip install -r requirements-gpu.txt
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
 python scripts/download_models.py
