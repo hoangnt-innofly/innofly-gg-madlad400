@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 import logging
 import re
-from typing import Any
 
 logger = logging.getLogger("madlad400-mt-api")
 
@@ -19,7 +18,7 @@ class MTEngine:
         model_id: str,
         *,
         device_map: str = "auto",
-        dtype: str = "bfloat16",
+        dtype: str = "auto",
         free_vram: bool = True,
         max_input_tokens: int = 480,
         batch_size: int = 4,
@@ -44,23 +43,24 @@ class MTEngine:
             return
 
         import torch
+        import transformers
         from transformers import T5ForConditionalGeneration, T5Tokenizer
 
         self.free_vram = self.free_vram and torch.cuda.is_available()
         device_map = self._resolve_device_map(torch)
         dtype = self._resolve_dtype(torch, device_map)
+        self._patch_t5_tied_weights()
 
         logger.info(
-            "Loading %s (device_map=%s, dtype=%s, free_vram=%s)",
+            "Loading %s (transformers=%s, device_map=%s, dtype=%s, free_vram=%s)",
             self.model_id,
+            transformers.__version__,
             device_map,
             dtype if dtype is not None else "auto/fp32",
             self.free_vram,
         )
         try:
-            # Same classes/call pattern as the google/madlad400-3b-mt and jbochi cards:
-            #   tokenizer = T5Tokenizer.from_pretrained(model_name)
-            #   model = T5ForConditionalGeneration.from_pretrained(model_name, device_map="auto")
+            # Same classes/call pattern as the google/madlad400-3b-mt card.
             self.tokenizer = T5Tokenizer.from_pretrained(self.model_id)
             load_kwargs: dict = {"device_map": device_map}
             if dtype is not None:
@@ -71,6 +71,7 @@ class MTEngine:
             probe_tokens = self.tokenizer.convert_ids_to_tokens(probe)
             if "<2en>" not in probe_tokens:
                 raise RuntimeError(f"Tokenizer split <2en>: {probe_tokens}")
+            self._assert_encoder_embeddings()
             self._ready = True
             logger.info(
                 "MADLAD-400 3B MT ready (%s) pad=%s eos=%s start=%s probe=%s",
@@ -252,6 +253,50 @@ class MTEngine:
             return next(self.model.parameters()).device
         except StopIteration:
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    @staticmethod
+    def _patch_t5_tied_weights() -> None:
+        """Transformers 5.x can bind MADLAD 3B encoder embeddings to lm_head (silent garbage)."""
+        import transformers
+        from transformers import T5ForConditionalGeneration
+
+        major = int(str(transformers.__version__).split(".", 1)[0])
+        keys = getattr(T5ForConditionalGeneration, "_tied_weights_keys", None)
+        if major < 5 or not isinstance(keys, dict):
+            return
+        T5ForConditionalGeneration._tied_weights_keys = {
+            "encoder.embed_tokens.weight": "shared.weight",
+            "decoder.embed_tokens.weight": "shared.weight",
+            "lm_head.weight": "shared.weight",
+        }
+        logger.warning(
+            "Patched T5 tied-weight order for transformers %s (MADLAD-400 3B)",
+            transformers.__version__,
+        )
+
+    def _assert_encoder_embeddings(self) -> None:
+        """Refuse to serve if encoder input embeddings were loaded from lm_head."""
+        import torch
+        import transformers
+
+        encoder = self.model.get_encoder().embed_tokens.weight.detach().float().cpu()
+        decoder = self.model.get_decoder().embed_tokens.weight.detach().float().cpu()
+        lm_head = self.model.lm_head.weight.detach().float().cpu()
+        enc_from_lm = torch.equal(encoder, lm_head)
+        enc_from_dec = torch.equal(encoder, decoder)
+        logger.info(
+            "Embedding check enc_absmax=%.2f lm_absmax=%.2f enc==decoder=%s enc==lm_head=%s",
+            float(encoder.abs().max()),
+            float(lm_head.abs().max()),
+            enc_from_dec,
+            enc_from_lm,
+        )
+        if enc_from_lm and not enc_from_dec:
+            raise RuntimeError(
+                "MADLAD-400 3B encoder embeddings were loaded from lm_head "
+                f"(transformers {transformers.__version__} bug). "
+                "Install transformers 4.57.x: pip install 'transformers>=4.44.0,<5'"
+            )
 
     def _resolve_device_map(self, torch) -> str:
         requested = (self.device_map or "auto").strip()

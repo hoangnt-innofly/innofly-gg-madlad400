@@ -1,11 +1,12 @@
 # CUDA 12.1 torch, same index as LTX / Qwen3-TTS.
 #   python -m pip install -r requirements-gpu.txt
+# MADLAD-400 3B is broken on transformers 5.x (encoder embeddings load from lm_head).
 --index-url https://download.pytorch.org/whl/cu121
 --extra-index-url https://pypi.org/simple
 
 -r requirements.txt
 torch
-transformers>=4.44.0
+transformers>=4.44.0,<5
 accelerate>=0.34.0
 sentencepiece>=0.2.0
 protobuf>=4.25.0
