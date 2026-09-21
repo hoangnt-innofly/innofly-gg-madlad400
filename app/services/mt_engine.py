@@ -57,7 +57,14 @@ class MTEngine:
             self.free_vram,
         )
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+            # extra_ids=0 + legacy=False match google/madlad400-3b-mt tokenizer_config.
+            # Default T5 extra_ids=100 shifts vocab → number/word salad.
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id,
+                use_fast=False,
+                extra_ids=0,
+                legacy=False,
+            )
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
                 self.model_id,
                 torch_dtype=dtype,
@@ -66,7 +73,15 @@ class MTEngine:
             )
             self.model.eval()
             self._ready = True
-            logger.info("MADLAD-400 3B MT ready (%s)", self._vram_log())
+            tag_ids = self.tokenizer.encode("<2en>", add_special_tokens=False)
+            logger.info(
+                "MADLAD-400 3B MT ready (%s) vocab=%s pad=%s eos=%s <2en>=%s",
+                self._vram_log(),
+                getattr(self.tokenizer, "vocab_size", None),
+                self.tokenizer.pad_token_id,
+                self.tokenizer.eos_token_id,
+                tag_ids,
+            )
         except Exception as exc:
             self.model = None
             self.tokenizer = None
@@ -132,24 +147,22 @@ class MTEngine:
             padding=True,
             truncation=True,
             max_length=self.max_input_tokens,
-        ).to(self._device())
+        )
+        enc = enc.to(self._device())
         src_len = int(enc["input_ids"].shape[-1])
-        gen_tokens = min(max_new_tokens, max(48, int(src_len * 2.0) + 16))
+        gen_tokens = min(max_new_tokens, max(64, src_len + 32))
 
         generate_kwargs: dict[str, Any] = {
             "max_new_tokens": gen_tokens,
-            "num_beams": max(1, num_beams),
+            "num_beams": max(1, min(num_beams, 5)),
             "length_penalty": length_penalty,
             "early_stopping": True,
             "do_sample": False,
-            "use_cache": True,
         }
-        pad_id = getattr(self.tokenizer, "pad_token_id", None)
-        eos_id = getattr(self.tokenizer, "eos_token_id", None)
-        if pad_id is not None:
-            generate_kwargs["pad_token_id"] = pad_id
-        if eos_id is not None:
-            generate_kwargs["eos_token_id"] = eos_id
+        if self.tokenizer.pad_token_id is not None:
+            generate_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+        if self.tokenizer.eos_token_id is not None:
+            generate_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
 
         outputs = self.model.generate(**enc, **generate_kwargs)
         decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
