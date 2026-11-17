@@ -114,7 +114,34 @@ Port `8002` avoids colliding with TTS/LTX on `8000`. Keep `MT_FREE_VRAM=0` so th
 - Greedy/sampling is worse than beam search for this model. Keep `do_sample` off.
 - `num_beams=4` matches the MADLAD examples; raise to 5–8 on the form if a sentence feels stiff.
 - Long documents are packed by paragraph/sentence under 480 tokens so the encoder is not truncated mid-sentence.
-- Auto-detect uses script heuristics (Vietnamese diacritics, CJK, Hangul, Thai, …) then `langdetect`.
+- Auto-detect uses script heuristics (Vietnamese diacritics, CJK, Hangul, Thai, …) then `langdetect`. Under 4 words `langdetect` is noise (`kite` → Finnish, `cape` → Romanian), so short Latin text is treated as an unreliable English guess and is never skipped as "same language".
+
+### Single words / short phrases
+
+MADLAD is a sentence model. With greedy decoding a lone word is often wrong: `kite` → `đi đi`, `kit` → `đi`, `cape` → `cape`. For input of at most `MT_SHORT_TEXT_MAX_WORDS` words (also each line of a one-word-per-line list) the engine:
+
+1. generates `MT_SHORT_TEXT_CANDIDATES` beam candidates for the word, its case-flipped form and `word.`;
+2. scores each candidate by `log P(candidate | word)` + `MT_SHORT_TEXT_BACKWARD_WEIGHT` × `log P(word | candidate)` (back-translation: `đi` translates back to "go", not "kit", so it loses);
+3. penalises degenerate repeats (`đi đi` next to `đi`, `X X X`; real reduplication like `từ từ`, `anak-anak` is left alone) and copies of a lower-case dictionary word (`cape` → `cape`, half-copies like `áo cape` less). Names, acronyms, numbers, URLs and e-mails (`Google`, `NASA`, `2024`, `a@b.com`) may be copied.
+
+"Short" means ≤ `MT_SHORT_TEXT_MAX_WORDS` space-separated words, or ≤ 4 characters for Chinese/Japanese/Thai/Lao/Khmer/Burmese (which have no spaces). At most `MT_SHORT_TEXT_MAX_UNITS` (default 50) units per request are reranked; further lines of a long word list use plain decoding so the request stays under the timeout.
+
+The server log prints the top candidates with their scores (`Short-text rerank ...`), which helps tune the weights. Set `MT_SHORT_TEXT_RERANK=0` to turn it off (this also stops word lists being split per line).
+
+Smoke test on the server (API running): `python scripts/check_short_words.py --key <SECRET_API_KEY> --target vi` translates ~30 ambiguous short words and prints the results.
+
+### Glossary (fixed translations)
+
+`data/glossary.json` (`MT_GLOSSARY_PATH`) overrides the model for exact terms. It is re-read when the file changes, no restart needed:
+
+```json
+{
+  "en->vi": { "kite": "con diều", "kit": "bộ dụng cụ", "cape": "áo choàng" },
+  "vi": { "MADLAD": "MADLAD" }
+}
+```
+
+A term matches only when it is the whole input, one line of a word list, or a whole paragraph (case-insensitive, trailing punctuation ignored). Use it for app vocabulary the model keeps getting wrong.
 
 This is still a 3B research MT model, not Google Translate’s production stack. High-resource pairs (vi↔en, en↔fr/de/es/zh/ja/ko) are the closest.
 

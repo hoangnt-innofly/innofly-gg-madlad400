@@ -1,0 +1,8 @@
+{
+  "_comment": "Fixed translations that override MADLAD. Section key: \"<source>-><target>\" or just \"<target>\" (any source). A term matches only when it is the whole input / line / paragraph (case-insensitive, trailing punctuation ignored). Edits are picked up without restarting.",
+  "en->vi": {
+    "kite": "con diều",
+    "kit": "bộ dụng cụ",
+    "cape": "áo choàng"
+  }
+}

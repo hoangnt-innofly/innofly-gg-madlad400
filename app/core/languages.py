@@ -127,6 +127,14 @@ _VI_CHARS = re.compile(
     re.IGNORECASE,
 )
 
+_VI_ONLY_CHARS = re.compile(
+    r"[ăắằẳẵặấầẩẫậếềểễệốồổỗộơớờởỡợưứừửữựđảạẻẽẹỉĩịỏọủũụỳỷỹỵ]",
+    re.IGNORECASE,
+)
+_WORD = re.compile(r"\w+", re.UNICODE)
+# Below this many words langdetect is not trusted (see detect_language_info).
+MIN_RELIABLE_WORDS = 4
+
 DEFAULT_SOURCE_LANGUAGE = "auto"
 DEFAULT_TARGET_LANGUAGE = "en"
 
@@ -168,24 +176,74 @@ def canonicalize_language(value: str | None, *, allow_auto: bool = True) -> str:
 
 def detect_language(text: str) -> str:
     """Best-effort source language. Script heuristics first, then langdetect."""
+    return detect_language_info(text)[0]
+
+
+def detect_language_info(text: str) -> tuple[str, bool]:
+    """Return (language, reliable).
+
+    langdetect is noise on one or two words ("kite" -> fi, "cape" -> ro, "dog" -> pt),
+    so short Latin-script input is reported as unreliable (plain ASCII as an English
+    guess, accented text as langdetect's guess). Callers must not skip translation
+    (source == target) on an unreliable guess.
+    """
     sample = (text or "").strip()
     if not sample:
-        return DEFAULT_TARGET_LANGUAGE
+        return DEFAULT_TARGET_LANGUAGE, False
+
+    words = _WORD.findall(sample[:4000])
+    long_enough = len(words) >= MIN_RELIABLE_WORDS
 
     script = _detect_script(sample[:4000])
     if script:
-        return script
+        if script != "vi":
+            return script, True
+        # á/à/é/ã… also occur in French/Spanish/Portuguese ("café", "été"): trust short
+        # text only with Vietnamese-only letters or when every word is a Vietnamese syllable
+        # ("nhà", "mèo", "cà phê").
+        reliable = (
+            long_enough
+            or bool(_VI_ONLY_CHARS.search(sample))
+            or (bool(words) and all(_is_vi_syllable(w) for w in words))
+        )
+        return script, reliable
 
+    if not long_enough:
+        # Plain-ASCII words are overwhelmingly English in practice ("kite" is not Finnish).
+        if sample.isascii():
+            return "en", False
+        return _langdetect_guess(sample) or "en", False
+
+    guess = _langdetect_guess(sample)
+    return guess or "en", guess is not None
+
+
+def _langdetect_guess(sample: str) -> str | None:
     try:
         from langdetect import DetectorFactory, detect
-        from langdetect.lang_detect_exception import LangDetectException
 
         DetectorFactory.seed = 0
         raw = detect(sample[:4000])
         mapped = _LANGDETECT_MAP.get(raw, raw)
         return canonicalize_language(mapped, allow_auto=False)
-    except (LangDetectException, ValueError, Exception):
-        return "en"
+    except Exception:
+        return None
+
+
+# Vietnamese syllable on accent-stripped letters: onset + vowel nucleus + coda.
+_VI_SYLLABLE = re.compile(
+    r"(?:ngh|ng|nh|ch|gh|gi|kh|ph|qu|th|tr|[bcdghklmnprstvx])?"
+    r"[aeiouy]{1,3}"
+    r"(?:ch|ng|nh|[cmnpt])?"
+)
+
+
+def _is_vi_syllable(word: str) -> bool:
+    import unicodedata
+
+    base = unicodedata.normalize("NFD", word.lower().replace("đ", "d"))
+    base = "".join(ch for ch in base if not unicodedata.combining(ch))
+    return _VI_SYLLABLE.fullmatch(base) is not None
 
 
 def _detect_script(sample: str) -> str | None:

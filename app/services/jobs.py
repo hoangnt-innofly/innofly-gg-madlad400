@@ -4,12 +4,14 @@ import asyncio
 import logging
 import threading
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
-from app.core.config import Settings
-from app.core.languages import canonicalize_language, detect_language
+from app.core.config import ROOT_DIR, Settings
+from app.core.languages import canonicalize_language, detect_language_info
+from app.services.glossary import Glossary
 from app.services.mock_engine import mock_translate
 
 logger = logging.getLogger("madlad400-mt-api")
@@ -63,6 +65,10 @@ class JobService:
         self._engine = None
         self._engine_lock = threading.Lock()
         self._worker_task: asyncio.Task | None = None
+        glossary_path = (settings.mt_glossary_path or "").strip()
+        if glossary_path and not Path(glossary_path).is_absolute():
+            glossary_path = str(ROOT_DIR / glossary_path)
+        self.glossary = Glossary(glossary_path or None)
 
     def start(self) -> None:
         if self._worker_task is None:
@@ -185,15 +191,36 @@ class JobService:
 
     def _run_job(self, job: Job) -> None:
         job.progress = "detecting_language"
-        detected = detect_language(job.text)
+        detected, reliable = detect_language_info(job.text)
         job.detected_language = detected
-        if job.source_language == "auto":
+        explicit_source = job.source_language != "auto"
+        if not explicit_source:
             job.source_language = detected
 
-        if job.source_language == job.target_language:
+        # Only skip on an explicit source or a trustworthy detection: langdetect guesses
+        # on one or two words are noise, and skipping would echo the input untranslated.
+        if job.source_language == job.target_language and (explicit_source or reliable):
             job.translation = job.text
             job.chunks = 1
             job.progress = "skipped_same_language"
+            return
+
+        # Unreliable guess: still usable as a back-translation hint, unless it equals the
+        # target (then we really do not know the source language).
+        source_hint = job.source_language
+        if not explicit_source and not reliable and source_hint == job.target_language:
+            source_hint = None
+
+        def lookup(segment: str) -> str | None:
+            return self.glossary.lookup(
+                segment, source_language=source_hint, target_language=job.target_language
+            )
+
+        whole = lookup(job.text)
+        if whole is not None:
+            job.translation = whole
+            job.chunks = 1
+            job.progress = "glossary"
             return
 
         if self.settings.mt_mock:
@@ -207,6 +234,8 @@ class JobService:
         translation, chunks = engine.translate(
             text=job.text,
             target_language=job.target_language,
+            source_language=source_hint,
+            lookup=lookup,
             num_beams=job.num_beams,
             length_penalty=job.length_penalty,
             max_new_tokens=job.max_new_tokens,
@@ -226,6 +255,13 @@ class JobService:
                     free_vram=self.settings.mt_free_vram,
                     max_input_tokens=self.settings.mt_default_max_input_tokens,
                     batch_size=self.settings.mt_default_batch_size,
+                    short_text_rerank=self.settings.mt_short_text_rerank,
+                    short_text_max_words=self.settings.mt_short_text_max_words,
+                    short_text_candidates=self.settings.mt_short_text_candidates,
+                    short_text_backward_weight=self.settings.mt_short_text_backward_weight,
+                    short_text_copy_penalty=self.settings.mt_short_text_copy_penalty,
+                    short_text_repeat_penalty=self.settings.mt_short_text_repeat_penalty,
+                    short_text_max_units=self.settings.mt_short_text_max_units,
                 )
             if not getattr(self._engine, "ready", False):
                 try:

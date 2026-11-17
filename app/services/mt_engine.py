@@ -3,6 +3,18 @@ from __future__ import annotations
 import gc
 import logging
 import re
+from typing import Callable
+
+from app.services.short_text import (
+    candidate_penalty,
+    clean_candidates,
+    contains_source,
+    input_variants,
+    is_plain_word,
+    is_short_text,
+    is_word_list,
+    normalize,
+)
 
 logger = logging.getLogger("madlad400-mt-api")
 
@@ -22,6 +34,13 @@ class MTEngine:
         free_vram: bool = True,
         max_input_tokens: int = 480,
         batch_size: int = 4,
+        short_text_rerank: bool = True,
+        short_text_max_words: int = 3,
+        short_text_candidates: int = 8,
+        short_text_backward_weight: float = 1.0,
+        short_text_copy_penalty: float = 1.5,
+        short_text_repeat_penalty: float = 2.0,
+        short_text_max_units: int = 50,
     ) -> None:
         self.model_id = model_id
         self.device_map = device_map
@@ -29,6 +48,15 @@ class MTEngine:
         self.free_vram = free_vram
         self.max_input_tokens = max_input_tokens
         self.batch_size = max(1, batch_size)
+        self.short_text_rerank = short_text_rerank
+        self.short_text_max_words = max(0, short_text_max_words)
+        self.short_text_candidates = max(1, min(short_text_candidates, 16))
+        self.short_text_backward_weight = max(0.0, short_text_backward_weight)
+        self.short_text_copy_penalty = max(0.0, short_text_copy_penalty)
+        self.short_text_repeat_penalty = max(0.0, short_text_repeat_penalty)
+        # Reranking costs ~3 beam searches + 2 scoring passes per unit; cap it per request so
+        # a long vocabulary list does not blow the 600 s request timeout.
+        self.short_text_max_units = max(0, short_text_max_units)
         self.model = None
         self.tokenizer = None
         self.sp = None
@@ -100,39 +128,196 @@ class MTEngine:
         *,
         text: str,
         target_language: str,
+        source_language: str | None = None,
         num_beams: int = 4,
         length_penalty: float = 1.0,
         max_new_tokens: int = 512,
+        lookup: Callable[[str], str | None] | None = None,
     ) -> tuple[str, int]:
+        """Translate ``text``; returns (translation, number of segments).
+
+        ``source_language`` is optional (MADLAD only needs the target tag); when known it
+        enables back-translation scoring for short input. ``lookup`` is a glossary hook
+        tried on every segment before the model.
+        """
         if not self._ready:
             self.load()
 
         import torch
 
-        chunks = self._chunk_text(text)
-        if not chunks:
+        paragraphs = self._segment(text)
+        if not paragraphs:
             return "", 0
 
-        translations: list[str] = []
+        out_paragraphs: list[str] = []
+        segments = 0
+        reranked = 0
         try:
             with torch.no_grad():
-                for start in range(0, len(chunks), self.batch_size):
-                    batch = chunks[start : start + self.batch_size]
-                    translations.extend(
-                        self._translate_batch(
-                            batch,
-                            target_language=target_language,
-                            num_beams=num_beams,
-                            length_penalty=length_penalty,
-                            max_new_tokens=max_new_tokens,
-                        )
-                    )
-            return self._rejoin(text, translations), len(chunks)
+                for units, joiner in paragraphs:
+                    out_units: list[str] = []
+                    for unit in units:
+                        segments += 1
+                        hit = lookup(unit) if lookup else None
+                        if hit is not None:
+                            out_units.append(hit)
+                        elif (
+                            self.short_text_rerank
+                            and reranked < self.short_text_max_units
+                            and is_short_text(unit, self.short_text_max_words)
+                        ):
+                            reranked += 1
+                            out_units.append(
+                                self._translate_short(
+                                    unit,
+                                    target_language=target_language,
+                                    source_language=source_language,
+                                    max_new_tokens=max_new_tokens,
+                                )
+                            )
+                        else:
+                            out_units.extend(
+                                self._translate_batch(
+                                    [unit],
+                                    target_language=target_language,
+                                    num_beams=num_beams,
+                                    length_penalty=length_penalty,
+                                    max_new_tokens=max_new_tokens,
+                                )
+                            )
+                    out_paragraphs.append(joiner.join(out_units))
+            if self.short_text_rerank and reranked >= self.short_text_max_units > 0:
+                logger.info(
+                    "Short-text rerank capped at %d units (MT_SHORT_TEXT_MAX_UNITS); "
+                    "remaining short lines used plain decoding",
+                    self.short_text_max_units,
+                )
+            return "\n\n".join(out_paragraphs), segments
         finally:
             if self.free_vram:
                 self.release_vram()
             else:
                 self._free_cuda()
+
+    def _translate_short(
+        self,
+        text: str,
+        *,
+        target_language: str,
+        source_language: str | None,
+        max_new_tokens: int,
+    ) -> str:
+        """Lone word / tiny phrase: generate many candidates, rerank, return the best.
+
+        Greedy decoding on a single word is unreliable ("kite" -> "đi đi", "kit" -> "đi",
+        "cape" -> "cape"). Score = forward log P(candidate | source)
+        + weight * backward log P(source | candidate) - penalties, all length-normalised.
+        The backward term rejects fluent-but-unrelated outputs such as "đi" (which
+        translates back to "go", not "kit").
+        """
+        n = self.short_text_candidates
+        device = self._device()
+        raw: list[str] = []
+        for variant in input_variants(text):
+            input_ids = self.tokenizer(
+                f"<2{target_language}> {variant}", return_tensors="pt"
+            ).input_ids.to(device)
+            src_len = int(input_ids.shape[-1])
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                num_beams=n,
+                num_return_sequences=n,
+                do_sample=False,
+                early_stopping=True,
+                max_new_tokens=min(max_new_tokens, 4 * src_len + 8),
+            )
+            raw.extend(self.tokenizer.batch_decode(outputs, skip_special_tokens=True))
+            del outputs, input_ids
+
+        candidates = clean_candidates(text, raw)
+        if not candidates:
+            return raw[0].strip() if raw else ""
+        if len(candidates) == 1:
+            return candidates[0]
+
+        across = bool(source_language) and source_language != target_language
+        forward = self._sequence_logprobs(
+            [f"<2{target_language}> {text}"] * len(candidates), candidates
+        )
+        # A plain dictionary word ("cape", "first aid kit") is expected to be translated.
+        # Names, acronyms, URLs, e-mails, numbers and code ("Google", "NASA", "iPhone",
+        # "a@b.com", "2024") may legitimately be copied, so they get no copy handling.
+        plain = is_plain_word(text)
+        copy_like = [plain and contains_source(text, c) for c in candidates]
+        backward = [0.0] * len(candidates)
+        backward_scored = across and self.short_text_backward_weight > 0
+        if backward_scored:
+            backward = self._sequence_logprobs(
+                [f"<2{source_language}> {c}" for c in candidates], [text] * len(candidates)
+            )
+            # Back-translating a (partial) copy of the source is trivially easy ("cape",
+            # "áo cape"), so its backward score says nothing about adequacy. Give such
+            # candidates the median backward score of the real translations instead.
+            real = sorted(b for b, copy in zip(backward, copy_like) if not copy)
+            if real:
+                neutral = real[len(real) // 2]
+                backward = [neutral if copy else b for b, copy in zip(backward, copy_like)]
+
+        lowercase_word = plain and text.strip() == text.strip().lower()
+        copy_penalty = self.short_text_copy_penalty if lowercase_word else 0.0
+        siblings = frozenset(normalize(c) for c in candidates)
+        scores: list[float] = []
+        for cand, fwd, bwd in zip(candidates, forward, backward):
+            penalty = candidate_penalty(
+                text,
+                cand,
+                siblings=siblings,
+                backward_scored=backward_scored,
+                translating_across_languages=across,
+                copy_penalty=copy_penalty,
+                repeat_penalty=self.short_text_repeat_penalty,
+            )
+            scores.append(fwd + self.short_text_backward_weight * bwd - penalty)
+
+        best = max(range(len(candidates)), key=lambda i: scores[i])
+        logger.info(
+            "Short-text rerank %r -> %r | %s",
+            text,
+            candidates[best],
+            ", ".join(
+                f"{c!r}:{sc:.2f}(f={f:.2f},b={b:.2f})"
+                for c, sc, f, b in sorted(
+                    zip(candidates, scores, forward, backward), key=lambda x: -x[1]
+                )[:6]
+            ),
+        )
+        return candidates[best]
+
+    def _sequence_logprobs(self, sources: list[str], targets: list[str]) -> list[float]:
+        """Length-normalised log P(target | source) for each pair (teacher forcing, incl. EOS)."""
+        import torch
+
+        device = self._device()
+        scores: list[float] = []
+        for start in range(0, len(sources), 16):
+            src_batch = sources[start : start + 16]
+            tgt_batch = targets[start : start + 16]
+            enc = self.tokenizer(src_batch, return_tensors="pt", padding=True)
+            lab = self.tokenizer(tgt_batch, return_tensors="pt", padding=True)
+            label_ids = lab.input_ids.to(device)
+            label_mask = lab.attention_mask.to(device).bool()
+            logits = self.model(
+                input_ids=enc.input_ids.to(device),
+                attention_mask=enc.attention_mask.to(device),
+                labels=label_ids.masked_fill(~label_mask, -100),
+            ).logits
+            logp = torch.log_softmax(logits.float(), dim=-1)
+            token_lp = logp.gather(-1, label_ids.unsqueeze(-1)).squeeze(-1)
+            token_lp = token_lp.masked_fill(~label_mask, 0.0)
+            lengths = label_mask.sum(-1).clamp(min=1)
+            scores.extend((token_lp.sum(-1) / lengths).tolist())
+            del logits, logp, token_lp, enc, lab, label_ids, label_mask
+        return scores
 
     def _translate_batch(
         self,
@@ -166,22 +351,29 @@ class MTEngine:
             torch.cuda.empty_cache()
         return decoded
 
-    def _chunk_text(self, text: str) -> list[str]:
-        """Pack paragraphs / sentences under the encoder limit to keep document context."""
-        paragraphs = re.split(r"(\n\s*\n)", text)
-        chunks: list[str] = []
-        for block in paragraphs:
+    def _segment(self, text: str) -> list[tuple[list[str], str]]:
+        """Split into paragraphs of translation units, each with the joiner to rebuild it.
+
+        * a paragraph that is a list of short terms (one per line) is translated line by
+          line, so "kite\\nkit\\ncape" is not fed to the model as one run-on phrase;
+        * otherwise a paragraph is one unit if it fits the encoder, else packed sentences.
+        Paragraphs are rejoined with a blank line.
+        """
+        paragraphs: list[tuple[list[str], str]] = []
+        for block in re.split(r"\n\s*\n", text):
             if _WHITESPACE_ONLY.match(block):
                 continue
             stripped = block.strip()
-            if not stripped:
+            if self.short_text_rerank and is_word_list(stripped, self.short_text_max_words):
+                lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+                paragraphs.append((lines, "\n"))
                 continue
             if self._token_len(f"<2en> {stripped}") <= self.max_input_tokens:
-                chunks.append(stripped)
+                paragraphs.append(([stripped], " "))
                 continue
-            packed = self._pack_sentences(stripped)
-            chunks.extend(packed)
-        return chunks
+            joiner = "\n" if "\n" in stripped else " "
+            paragraphs.append((self._pack_sentences(stripped), joiner))
+        return paragraphs
 
     def _pack_sentences(self, paragraph: str) -> list[str]:
         sentences = [part.strip() for part in _SENTENCE_SPLIT.split(paragraph) if part.strip()]
@@ -226,18 +418,6 @@ class MTEngine:
 
     def _token_len(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=True))
-
-    @staticmethod
-    def _rejoin(original: str, translations: list[str]) -> str:
-        if not translations:
-            return ""
-        if len(translations) == 1:
-            return translations[0]
-        if re.search(r"\n\s*\n", original):
-            return "\n\n".join(translations)
-        if "\n" in original:
-            return "\n".join(translations)
-        return " ".join(translations)
 
     def release_vram(self) -> None:
         """Drop the GPU model so Comfy/LTX/TTS can use the 12GB card (reload on next job)."""
