@@ -9,6 +9,7 @@ from app.services.short_text import (
     candidate_penalty,
     clean_candidates,
     contains_source,
+    english_context,
     input_variants,
     is_plain_word,
     is_short_text,
@@ -217,8 +218,15 @@ class MTEngine:
         """
         n = self.short_text_candidates
         device = self._device()
+        variants = input_variants(text)
+        # Inputs a candidate may be a translation of (forward score = best over these).
+        anchors = [text]
+        context = english_context(text) if source_language == "en" else None
+        if context:
+            variants.append(context)
+            anchors.append(context)
         raw: list[str] = []
-        for variant in input_variants(text):
+        for variant in variants:
             input_ids = self.tokenizer(
                 f"<2{target_language}> {variant}", return_tensors="pt"
             ).input_ids.to(device)
@@ -241,9 +249,12 @@ class MTEngine:
             return candidates[0]
 
         across = bool(source_language) and source_language != target_language
-        forward = self._sequence_logprobs(
-            [f"<2{target_language}> {text}"] * len(candidates), candidates
-        )
+        forward = [float("-inf")] * len(candidates)
+        for anchor in anchors:
+            scored = self._sequence_logprobs(
+                [f"<2{target_language}> {anchor}"] * len(candidates), candidates
+            )
+            forward = [max(a, b) for a, b in zip(forward, scored)]
         # A plain dictionary word ("cape", "first aid kit") is expected to be translated.
         # Names, acronyms, URLs, e-mails, numbers and code ("Google", "NASA", "iPhone",
         # "a@b.com", "2024") may legitimately be copied, so they get no copy handling.

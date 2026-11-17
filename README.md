@@ -120,7 +120,7 @@ Port `8002` avoids colliding with TTS/LTX on `8000`. Keep `MT_FREE_VRAM=0` so th
 
 MADLAD is a sentence model. With greedy decoding a lone word is often wrong: `kite` → `đi đi`, `kit` → `đi`, `cape` → `cape`. For input of at most `MT_SHORT_TEXT_MAX_WORDS` words (also each line of a one-word-per-line list) the engine:
 
-1. generates `MT_SHORT_TEXT_CANDIDATES` beam candidates for the word, its case-flipped form and `word.`;
+1. generates `MT_SHORT_TEXT_CANDIDATES` beam candidates for the word, its case-flipped form and `word.`; when the source is (or is guessed as) English and the input is a lower-case plain word, also for `the word`. MADLAD has no source tag, so a bare word that exists in another language is read in that language (`cap` = Catalan "none" → `không có`; `pain` = French "bread"; `gift` = German "poison"); the article pins the English reading. A candidate's forward score is its best over `word` and `the word`;
 2. scores each candidate by `log P(candidate | word)` + `MT_SHORT_TEXT_BACKWARD_WEIGHT` × `log P(word | candidate)` (back-translation: `đi` translates back to "go", not "kit", so it loses);
 3. penalises degenerate repeats (`đi đi` next to `đi`, `X X X`; real reduplication like `từ từ`, `anak-anak` is left alone) and copies of a lower-case dictionary word (`cape` → `cape`, half-copies like `áo cape` less). Names, acronyms, numbers, URLs and e-mails (`Google`, `NASA`, `2024`, `a@b.com`) may be copied.
 

@@ -72,6 +72,25 @@ def input_variants(text: str) -> list[str]:
     return [v for v in variants if not (v in seen or seen.add(v))]
 
 
+_ENGLISH_ARTICLE = re.compile(r"(?:the|a|an|to)\s", re.IGNORECASE)
+
+
+def english_context(text: str) -> str | None:
+    """'cap' -> 'the cap': pins the source language to English.
+
+    MADLAD has no source-language tag, so a bare word that is also a word elsewhere is
+    often read in the other language (Catalan "cap" = "none" -> "không có", French
+    "pain" = bread, German "gift" = poison). An English article removes that ambiguity
+    and adds candidates from the English reading. Lower-case plain words only.
+    """
+    core = normalize(text)
+    if not core or not is_plain_word(core) or core != text.strip().rstrip(_TRAILING_PUNCT).strip():
+        return None
+    if _ENGLISH_ARTICLE.match(core):
+        return None
+    return f"the {core}"
+
+
 def match_surface(source: str, candidate: str) -> str:
     """Make a candidate's trailing punctuation / leading case follow the source.
 
