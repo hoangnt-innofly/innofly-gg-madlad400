@@ -9,8 +9,11 @@ for short input and reranks them; this module holds the model-free parts
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
+
+logger = logging.getLogger("madlad400-mt-api")
 
 _EDGE_PUNCT = " \t\r\n\"'`“”‘’«»()[]{}"
 _TRAILING_PUNCT = ".,;:!?…。！？、，；："
@@ -53,9 +56,19 @@ def is_short_text(text: str, max_words: int, max_chars: int = 48) -> bool:
     return 0 < len(words) <= max_words
 
 
+def _has_case_seam(text: str) -> bool:
+    """A lower-case letter directly followed by an upper-case one ("iPhone", "userName")."""
+    return any(a.islower() and b.isupper() for a, b in zip(text, text[1:]))
+
+
 def is_plain_word(text: str) -> bool:
-    """Letters-only word or phrase (no digits, URLs, e-mails, paths, identifiers)."""
-    return _PLAIN_WORDS.fullmatch(normalize(text)) is not None
+    """Letters-only word or phrase (no digits, URLs, e-mails, paths, identifiers).
+
+    camelCase names ("iPhone", "YouTube", "PlayStation") are not plain: normalize()
+    casefolds, so without the seam check they got the copy handling meant for words that
+    ought to be translated, and their correct copies lost to junk ("iPhoneName").
+    """
+    return not _has_case_seam(text or "") and _PLAIN_WORDS.fullmatch(normalize(text)) is not None
 
 
 def input_variants(text: str) -> list[str]:
@@ -116,17 +129,93 @@ def match_surface(source: str, candidate: str) -> str:
     return cand
 
 
+# A capitalised ASCII word piece at the very end of a candidate ("Name", "ID").
+_GLUED_TAIL = re.compile(r"[A-Z](?:[a-z]+|[A-Z]*)$")
+_LATIN_LETTER = re.compile(r"[A-Za-z]")
+
+
+def _cased_run(text: str) -> str:
+    """Trailing run of cased letters: 'giao tiếp' -> 'tiếp', '使用Power' -> 'Power', '交流' -> ''."""
+    i = len(text)
+    while i > 0 and (text[i - 1].islower() or text[i - 1].isupper()):
+        i -= 1
+    return text[i:]
+
+
+def _letters_key(text: str) -> str:
+    """Casefolded letters/digits without accents or separators: 'Việt Nam' -> 'vietnam'."""
+    return "".join(c for c in unicodedata.normalize("NFD", (text or "").casefold()) if c.isalnum())
+
+
+def strip_glued_tail(
+    source: str, candidate: str, siblings: set[str] | frozenset[str] = frozenset()
+) -> str:
+    """Cut an identifier piece the model glued onto a candidate ("giao tiếpName" -> "giao tiếp").
+
+    On a bare word MADLAD sometimes reads the input as a UI / i18n key and continues the
+    last word like "userName": "Name" is one SentencePiece token without a word-start
+    marker, so "communication" -> ['▁giao', '▁tiếp', 'Name'] and "iPhone" -> ['▁iPhone',
+    'Name']. Length-normalised scores barely punish one extra confident token, and a glued
+    copy ("iPhoneName") back-translates as easily as the copy itself, so such junk can win.
+
+    A capitalised ASCII piece at the end, glued to a lower-case or caseless letter, is cut
+    when the source does not spell the glued word that way ("JavaScript", "YouTube" for
+    "you tube", "userName" stay), more than a one-letter prefix precedes it ("iPhone",
+    "eBay", "mRNA", Irish "an tSeirbhís" stay), and
+    * what is left is the source ("iPhoneName", "TikTokName"), or
+    * what is left is another candidate ("HoaName" next to "Hoa"), unless that is a lone
+      ASCII word and the source has no Latin letters ("Git" next to "GitHub" for 깃허브 may
+      just be a truncated beam), or
+    * the piece is glued to a lower-case word with non-ASCII letters, which is never real
+      spelling ("tiếpName", "khoảnData"; "ViệtNam", "ÄrztInnen" start with a capital).
+    Stacked pieces ("tiếpUserName") are peeled one by one. Anything else is returned as is.
+    """
+    text = unicodedata.normalize("NFC", candidate or "").strip()
+    core = text.rstrip(_TRAILING_PUNCT).rstrip()
+    src_key, src_letters = normalize(source), _letters_key(source)
+    latin_source = _LATIN_LETTER.search(source or "") is not None
+    head, best = core, None
+    while (match := _GLUED_TAIL.search(head)) and match.start() > 0:
+        rest = head[: match.start()]
+        if not rest[-1].isalpha() or rest[-1].isupper():
+            break  # "IJsselmeer", spaced "giao tiếp Name"
+        run = _cased_run(rest)
+        if len(run) == 1 or _letters_key(run + match.group()) in src_letters:
+            break  # "eBay"; the source has it ("JavaScript")
+        head = rest
+        key = normalize(head)
+        sibling = key in siblings and (latin_source or " " in key or not key.isascii())
+        if key == src_key or sibling or (run.islower() and not run.isascii()):
+            best = head
+    return candidate if best is None else best + text[len(core) :]
+
+
 def clean_candidates(source: str, raw: list[str]) -> list[str]:
-    """Strip, harmonise surface form, and de-duplicate while keeping beam order."""
+    """Strip, harmonise surface form, cut glued junk tails, and de-duplicate in beam order.
+
+    A candidate with a glued tail collapses into its head ("giao tiếpName" -> "giao tiếp"),
+    so the junk filter never empties the list.
+    """
+    surfaced = [match_surface(source, cand) for cand in raw]
+    siblings = frozenset(key for key in map(normalize, surfaced) if key)
     out: list[str] = []
     seen: set[str] = set()
-    for cand in raw:
-        surfaced = match_surface(source, cand)
-        key = normalize(surfaced)
+    cut: dict[str, str] = {}
+    for cand in surfaced:
+        stripped = strip_glued_tail(source, cand, siblings)
+        if stripped != cand:
+            cut.setdefault(cand, stripped)
+        key = normalize(stripped)
         if not key or key in seen:
             continue
         seen.add(key)
-        out.append(surfaced)
+        out.append(stripped)
+    if cut:
+        logger.info(
+            "Short-text %r: cut glued tails %s",
+            source,
+            ", ".join(f"{junk!r} -> {head!r}" for junk, head in cut.items()),
+        )
     return out
 
 

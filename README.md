@@ -122,13 +122,17 @@ MADLAD is a sentence model. With greedy decoding a lone word is often wrong: `ki
 
 1. generates `MT_SHORT_TEXT_CANDIDATES` beam candidates for the word, its case-flipped form and `word.`; when the source is (or is guessed as) English and the input is a lower-case plain word, also for `the word`. MADLAD has no source tag, so a bare word that exists in another language is read in that language (`cap` = Catalan "none" → `không có`; `pain` = French "bread"; `gift` = German "poison"); the article pins the English reading. A candidate's forward score is its best over `word` and `the word`;
 2. scores each candidate by `log P(candidate | word)` + `MT_SHORT_TEXT_BACKWARD_WEIGHT` × `log P(word | candidate)` (back-translation: `đi` translates back to "go", not "kit", so it loses);
-3. penalises degenerate repeats (`đi đi` next to `đi`, `X X X`; real reduplication like `từ từ`, `anak-anak` is left alone) and copies of a lower-case dictionary word (`cape` → `cape`, half-copies like `áo cape` less). Names, acronyms, numbers, URLs and e-mails (`Google`, `NASA`, `2024`, `a@b.com`) may be copied.
+3. penalises degenerate repeats (`đi đi` next to `đi`, `X X X`; real reduplication like `từ từ`, `anak-anak` is left alone) and copies of a lower-case dictionary word (`cape` → `cape`, half-copies like `áo cape` less). Names, acronyms, numbers, URLs and e-mails (`Google`, `NASA`, `iPhone`, `2024`, `a@b.com`) may be copied.
+
+Before scoring, an identifier piece the model glued onto a candidate is cut off (`communication` → `giao tiếpName` → `giao tiếp`, `iPhone` → `iPhoneName` → `iPhone`): on a bare word MADLAD sometimes reads the input as a UI key (`userName`), and the per-token average score barely punishes the extra token. Inner capitals the source has (`JavaScript`), one-letter prefixes (`eBay`, Irish `an tSeirbhís`) and capitalised compounds (`ViệtNam`) are kept. The log line `Short-text ...: cut glued tails ...` shows each cut.
 
 "Short" means ≤ `MT_SHORT_TEXT_MAX_WORDS` space-separated words, or ≤ 4 characters for Chinese/Japanese/Thai/Lao/Khmer/Burmese (which have no spaces). At most `MT_SHORT_TEXT_MAX_UNITS` (default 50) units per request are reranked; further lines of a long word list use plain decoding so the request stays under the timeout.
 
 The server log prints the top candidates with their scores (`Short-text rerank ...`), which helps tune the weights. Set `MT_SHORT_TEXT_RERANK=0` to turn it off (this also stops word lists being split per line).
 
 Smoke test on the server (API running): `python scripts/check_short_words.py --key <SECRET_API_KEY> --target vi` translates ~30 ambiguous short words and prints the results.
+
+Model-free unit tests (no GPU): `python -m pip install pytest`, then `python -m pytest tests` from the repo root.
 
 ### Glossary (fixed translations)
 

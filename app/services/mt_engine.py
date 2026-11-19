@@ -256,8 +256,9 @@ class MTEngine:
             )
             forward = [max(a, b) for a, b in zip(forward, scored)]
         # A plain dictionary word ("cape", "first aid kit") is expected to be translated.
-        # Names, acronyms, URLs, e-mails, numbers and code ("Google", "NASA", "iPhone",
-        # "a@b.com", "2024") may legitimately be copied, so they get no copy handling.
+        # camelCase names, URLs, e-mails, numbers and code ("iPhone", "a@b.com", "2024")
+        # may legitimately be copied, so they get no copy handling. Capitalised words and
+        # acronyms ("Google", "NASA") get no copy penalty, only the neutral backward score.
         plain = is_plain_word(text)
         copy_like = [plain and contains_source(text, c) for c in candidates]
         backward = [0.0] * len(candidates)
