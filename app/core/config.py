@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.languages import DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE
@@ -30,7 +31,15 @@ class Settings(BaseSettings):
 
     mt_default_source_language: str = DEFAULT_SOURCE_LANGUAGE
     mt_default_target_language: str = DEFAULT_TARGET_LANGUAGE
-    mt_default_num_beams: int = 4
+    # Beam width when a request does not send num_beams. Read from MT_NUM_BEAMS, not
+    # MT_DEFAULT_NUM_BEAMS: deployed .env files copied from the old example pin
+    # MT_DEFAULT_NUM_BEAMS=1 (greedy), which mistranslates short Japanese sentences more
+    # often, and 4 should apply without editing the server. The old name is only read to
+    # warn that it is ignored.
+    mt_default_num_beams: int = Field(default=4, ge=1, le=8, validation_alias="MT_NUM_BEAMS")
+    legacy_default_num_beams: int | None = Field(
+        default=None, validation_alias="MT_DEFAULT_NUM_BEAMS"
+    )
     mt_default_length_penalty: float = 1.0
     mt_default_max_new_tokens: int = 512
     mt_default_max_input_tokens: int = 480

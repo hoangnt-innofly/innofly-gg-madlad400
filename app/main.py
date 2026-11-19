@@ -13,6 +13,18 @@ from app.core.config import ROOT_DIR, get_settings
 
 settings = get_settings()
 
+if (
+    settings.legacy_default_num_beams is not None
+    and settings.legacy_default_num_beams != settings.mt_default_num_beams
+):
+    import logging
+
+    logging.getLogger("uvicorn.error").warning(
+        "MT_DEFAULT_NUM_BEAMS=%s is ignored; using num_beams=%s (set MT_NUM_BEAMS to change it)",
+        settings.legacy_default_num_beams,
+        settings.mt_default_num_beams,
+    )
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
