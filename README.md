@@ -12,7 +12,7 @@ Submit source text + target language. One request waits and returns `translation
 | Mode | Encoder–decoder T5 MT (`<2xx>` target prefix) |
 | Languages | 400+; form lists common ones, any MADLAD ISO code is accepted |
 | Decode | Beam search (`num_beams=4`, `do_sample=false`) |
-| Long text | Split / pack paragraphs under 480 encoder tokens to keep context |
+| Long text | One model input per line / sentence (CJK split at 。！？ with no space needed), decoded in padded batches |
 | VRAM | ~6 GB BF16 while translating; released after each job (`MT_FREE_VRAM=1`) |
 
 MADLAD only needs the **target** language tag (`<2vi>`, `<2en>`, `<2zh>`). Source language is optional and used for Auto-detect + skip-if-same-language.
@@ -113,8 +113,29 @@ Port `8002` avoids colliding with TTS/LTX on `8000`. Keep `MT_FREE_VRAM=0` so th
 
 - Greedy/sampling is worse than beam search for this model. Keep `do_sample` off.
 - `num_beams=4` matches the MADLAD examples; raise to 5–8 on the form if a sentence feels stiff.
-- Long documents are packed by paragraph/sentence under 480 tokens so the encoder is not truncated mid-sentence.
+- Text is translated line by line and sentence by sentence (see *Segmentation and batching*): MADLAD drops sentences when several reach it as one input.
 - Auto-detect uses script heuristics (Vietnamese diacritics, CJK, Hangul, Thai, …) then `langdetect`. Under 4 words `langdetect` is noise (`kite` → Finnish, `cape` → Romanian), so short Latin text is treated as an unreliable English guess and is never skipped as "same language".
+
+### Segmentation and batching
+
+MADLAD-400 is trained on sentence pairs. Sent a title line plus seven sentences as one input it keeps only some of them, or (with the line break inside) writes new text in the source language. So the engine (`app/services/segmenter.py`):
+
+1. keeps every line separate (titles, list items, dialogue lines) and copies the line breaks, blank lines and indentation (full-width space U+3000) of the source into the output (U+2028, U+2029, VT, FF and NEL count as line breaks and come out as `
+`); a sentence that an e-mail client hard-wrapped is merged back (spaced scripts: the next line starts in lower case; CJK: 2+ lines that do not end a sentence share one fixed length, so a title line or chat messages of similar length stay separate);
+2. translates a heading line `LABEL：content` / `LABEL: content` as two units, the label alone and the content alone. Sent whole, `テーマ：環境問題と私たちの生活` came back as `Bản mẫu:Công nghiệp và môi trường` (MADLAD read it as the wiki namespace "Template:"); the content alone translates correctly. The label gets the glossary (`ja->vi`: `テーマ` → `Chủ đề`; bare `テーマ` alone gives `Sắc thái`), else the short-text rerank, else plain decoding. If the content is a single short unit it gets the short-text rerank like a whole line (`kite` of `Word: kite`). Output: `label: content`, or `label：content` for `ja` / `zh` / `yue` when the translated label has a CJK character (`問1：`). A bullet in front of the label (`・テーマ：…`, `■注意：…`, `# Theme: …`) is copied as is and is not part of the label. A label is at most 6 CJK characters or 2 words with no sentence punctuation; times, ratios and URLs (`10:30`, `1:2`, `http://`), `Q: …` and longer clauses before a colon stay whole;
+3. splits each line into sentences: `。！？` and other script stops split even without a following space; `.!?` need a space, or CJK / Hangul on both sides (`我很好.你呢`). These do not split: abbreviations with or without a space after them (`Mr.`, `Mr.田中`, `U.S.出身`, `Inc.の`, `z.B.`, `No. 5`, `Jan. 5`, `Mt. Fuji`), ordinals (`am 24. Dezember`, `1. Dünya`; 4-digit years still end a sentence), decimals, initials, list markers, and a closing quote glued to the next word (`「行こう。」と言った。`, `"Hi!"라고 말했다.`, `“我来了。”他说。`);
+4. never packs CJK / Korean / Thai-like sentences together; consecutive sentences of a spaced script (`en`, `vi`, `de`, …) on one line are packed up to `MT_SEGMENT_PACK_TOKENS` (default 256) because MADLAD keeps them and uses the context. A pack is re-translated sentence by sentence only when its output misses 2+ sentences, misses one and is under 75% of the source length in tokens, is under 50% whatever its sentence count, or has a retry issue (loop, wrong script, cut off). One sentence short at full length usually means two sentences were joined in the target, so that translation is kept. `0` = one sentence per input everywhere;
+5. joins the outputs with the target's spacing: no space between sentences for `ja` / `zh` / `yue`, one space otherwise.
+
+Units are decoded in padded `generate()` calls of up to `MT_DEFAULT_BATCH_SIZE` rows, sorted by length, capped at `MT_BATCH_MAX_TOKENS` KV-cache slots (rows × beams × (source + output) tokens; ~256 KiB each in bf16, so 4096 ≈ 1 GiB). A CUDA OOM halves the batch instead of failing the job. Each row may generate `max(64, 2 × source tokens + 32)` tokens (capped by `max_new_tokens`), then every row is checked:
+
+| Problem | Retry |
+| --- | --- |
+| stopped without EOS (cut off) | same decoding, `4 × source + 64` tokens |
+| repetition loop (`近近近…`, a sentence repeated) with more copies than any repetition in the source (`頑張れ`×4 → `Cố lên, cố lên, cố lên, cố lên!` is not a loop) | `num_beams=4`, `no_repeat_ngram_size=4`; still looping → cut to one copy |
+| wrong script (Japanese out for `vi`), or < 30% of the source length | `num_beams=4`, only when the request used fewer beams (at 4+ the retry would repeat the same search; the row is just logged) |
+
+A retry is kept only if it is better; anything still wrong is logged (`MT output still …`).
 
 ### Single words / short phrases
 
@@ -128,7 +149,7 @@ Before scoring, an identifier piece the model glued onto a candidate is cut off 
 
 "Short" means ≤ `MT_SHORT_TEXT_MAX_WORDS` space-separated words, or ≤ 4 characters for Chinese/Japanese/Thai/Lao/Khmer/Burmese (which have no spaces). At most `MT_SHORT_TEXT_MAX_UNITS` (default 50) units per request are reranked; further lines of a long word list use plain decoding so the request stays under the timeout.
 
-The server log prints the top candidates with their scores (`Short-text rerank ...`), which helps tune the weights. Set `MT_SHORT_TEXT_RERANK=0` to turn it off (this also stops word lists being split per line).
+The server log prints the top candidates with their scores (`Short-text rerank ...`), which helps tune the weights. Set `MT_SHORT_TEXT_RERANK=0` to turn it off (lines are still translated one by one). A short line is reranked only when it is the whole input, a paragraph of its own (blank lines around it), or one line of a block where every line is short (`kite\ncape\nkit`). The short lines of a letter (`Hi John,` / `Best regards,` / `Anna` around a longer line) and short sentences inside a line (`Thanks!`, `次。`) use plain decoding. A heading label with no glossary entry (`Note` of `Note: …`) is reranked as a lone word, and so is the content of a heading line when it is one short unit (`kite` of `Word: kite`). Each text is reranked once per request: a speaker name repeated on every line of a dialogue (`田中：…`) reuses the first result.
 
 Smoke test on the server (API running): `python scripts/check_short_words.py --key <SECRET_API_KEY> --target vi` translates ~30 ambiguous short words and prints the results.
 
@@ -145,7 +166,7 @@ Model-free unit tests (no GPU): `python -m pip install pytest`, then `python -m 
 }
 ```
 
-A term matches only when it is the whole input, one line of a word list, or a whole paragraph (case-insensitive, trailing punctuation ignored). Use it for app vocabulary the model keeps getting wrong.
+A term matches only when it is the whole input, a whole line, a heading label (`テーマ` of `テーマ：…`), or one translation unit of a line (a CJK sentence, or a pack of spaced-script sentences; case-insensitive, trailing punctuation ignored). Use it for app vocabulary the model keeps getting wrong.
 
 This is still a 3B research MT model, not Google Translate’s production stack. High-resource pairs (vi↔en, en↔fr/de/es/zh/ja/ko) are the closest.
 

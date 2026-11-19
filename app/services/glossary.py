@@ -7,8 +7,9 @@ File format (JSON, UTF-8). Keys are "<target>" (any source) or "<source>-><targe
       "vi": {"MADLAD": "MADLAD"}
     }
 
-A glossary entry only fires when the *whole* segment (the full input, one line of a
-word list, or one paragraph) matches the key, case-insensitively and ignoring
+A glossary entry only fires when the *whole* segment (the full input, a whole line, a
+heading label such as テーマ of "テーマ：…", or one translation unit of a line) matches
+the key, case-insensitively and ignoring
 surrounding quotes / trailing punctuation. The file is re-read when it changes, so
 entries can be added without restarting the API.
 """

@@ -2,9 +2,28 @@ from __future__ import annotations
 
 import gc
 import logging
-import re
 from typing import Callable
 
+from app.services.generation import (
+    GenResult,
+    assess,
+    output_budget,
+    pack_incomplete,
+    plan_batches,
+    retry_budget,
+    retry_kind,
+    row_stats,
+    severity,
+    trim_loop,
+)
+from app.services.segmenter import (
+    Unit,
+    count_sentences,
+    join_units,
+    line_sources,
+    split_text,
+    target_base,
+)
 from app.services.short_text import (
     candidate_penalty,
     clean_candidates,
@@ -19,8 +38,15 @@ from app.services.short_text import (
 
 logger = logging.getLogger("madlad400-mt-api")
 
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…。！？])\s+")
-_WHITESPACE_ONLY = re.compile(r"^\s*$")
+# Targets written without sentence punctuation in practice: a pack's sentence count
+# cannot be checked in the output, so their source sentences are never packed.
+_NO_SENTENCE_PUNCT_TARGETS = frozenset({"th", "lo"})
+# Beam width of the "loop" / "beam" retries.
+_RETRY_BEAMS = 4
+
+
+def _is_oom(exc: BaseException) -> bool:
+    return type(exc).__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower()
 
 
 class MTEngine:
@@ -42,6 +68,9 @@ class MTEngine:
         short_text_copy_penalty: float = 1.5,
         short_text_repeat_penalty: float = 2.0,
         short_text_max_units: int = 50,
+        segment_pack_tokens: int = 256,
+        segment_clause_tokens: int = 96,
+        batch_max_tokens: int = 4096,
     ) -> None:
         self.model_id = model_id
         self.device_map = device_map
@@ -58,6 +87,15 @@ class MTEngine:
         # Reranking costs ~3 beam searches + 2 scoring passes per unit; cap it per request so
         # a long vocabulary list does not blow the 600 s request timeout.
         self.short_text_max_units = max(0, short_text_max_units)
+        # Spaced-script sentences of one line are packed up to this many tokens (0 = one
+        # sentence per model call everywhere). CJK-like sentences are never packed.
+        self.segment_pack_tokens = max(0, segment_pack_tokens)
+        # Thai/Lao lines without sentence punctuation are cut at spaces above this size.
+        self.segment_clause_tokens = max(16, segment_clause_tokens)
+        # KV-cache cap per generate() call, in rows * beams * (source + output) tokens.
+        # ~256 KiB per slot on MADLAD-3B bf16, so 4096 is ~1 GiB: no more than one
+        # 480-token input at 4-5 beams needed before batching existed.
+        self.batch_max_tokens = max(1, batch_max_tokens)
         self.model = None
         self.tokenizer = None
         self.sp = None
@@ -139,61 +177,82 @@ class MTEngine:
 
         ``source_language`` is optional (MADLAD only needs the target tag); when known it
         enables back-translation scoring for short input. ``lookup`` is a glossary hook
-        tried on every segment before the model.
+        tried on every line that was split, then on every unit, before the model.
+
+        The text is cut into lines and sentences (``segmenter.split_text``): MADLAD is a
+        sentence-level model and drops sentences, or writes new source-language text,
+        when a title line plus several sentences reach it as one input. Units that miss
+        the glossary and the short-text path are decoded together in padded batches.
+
+        Short-text rerank (see ``_rerank_lines``): a short whole line (or the whole
+        content of a heading line, "kite" of "Word: kite") when its block is one line or
+        a word list, and a short heading label ("Note" of "Note: ..."), which reaches
+        the model as a lone word. A text is reranked once per request: a speaker name
+        repeated on every line of a dialogue ("田中：…") reuses the first result.
         """
         if not self._ready:
             self.load()
 
         import torch
 
-        paragraphs = self._segment(text)
-        if not paragraphs:
+        units = self._segment(text, target_language)
+        if not units:
             return "", 0
 
-        out_paragraphs: list[str] = []
-        segments = 0
+        outputs: list[str | None] = [None] * len(units)
+        if lookup:
+            self._lookup_lines(units, outputs, lookup)
+        rerank_lines = self._rerank_lines(units) if self.short_text_rerank else frozenset()
+        pending: list[int] = []
         reranked = 0
+        short_memo: dict[str, str] = {}
         try:
             with torch.no_grad():
-                for units, joiner in paragraphs:
-                    out_units: list[str] = []
-                    for unit in units:
-                        segments += 1
-                        hit = lookup(unit) if lookup else None
-                        if hit is not None:
-                            out_units.append(hit)
-                        elif (
-                            self.short_text_rerank
-                            and reranked < self.short_text_max_units
-                            and is_short_text(unit, self.short_text_max_words)
-                        ):
-                            reranked += 1
-                            out_units.append(
-                                self._translate_short(
-                                    unit,
-                                    target_language=target_language,
-                                    source_language=source_language,
-                                    max_new_tokens=max_new_tokens,
-                                )
-                            )
-                        else:
-                            out_units.extend(
-                                self._translate_batch(
-                                    [unit],
-                                    target_language=target_language,
-                                    num_beams=num_beams,
-                                    length_penalty=length_penalty,
-                                    max_new_tokens=max_new_tokens,
-                                )
-                            )
-                    out_paragraphs.append(joiner.join(out_units))
+                for i, unit in enumerate(units):
+                    if outputs[i] is not None:
+                        continue
+                    if not unit.translate:
+                        outputs[i] = unit.text  # numbers / symbols only
+                        continue
+                    # Glossary first: a heading label with an entry (テーマ -> Chủ đề)
+                    # never reaches the rerank or the model.
+                    hit = lookup(unit.text) if lookup else None
+                    if hit is not None:
+                        outputs[i] = hit
+                    elif unit.text in short_memo:
+                        outputs[i] = short_memo[unit.text]
+                    elif (
+                        self.short_text_rerank
+                        and (unit.label or (unit.whole_line and unit.line in rerank_lines))
+                        and reranked < self.short_text_max_units
+                        and is_short_text(unit.text, self.short_text_max_words)
+                    ):
+                        reranked += 1
+                        outputs[i] = short_memo[unit.text] = self._translate_short(
+                            unit.text,
+                            target_language=target_language,
+                            source_language=source_language,
+                            max_new_tokens=max_new_tokens,
+                        )
+                    else:
+                        pending.append(i)
+                if pending:
+                    decoded = self._translate_units(
+                        [units[i] for i in pending],
+                        target_language=target_language,
+                        num_beams=num_beams,
+                        length_penalty=length_penalty,
+                        max_new_tokens=max_new_tokens,
+                    )
+                    for i, out in zip(pending, decoded):
+                        outputs[i] = out
             if self.short_text_rerank and reranked >= self.short_text_max_units > 0:
                 logger.info(
                     "Short-text rerank capped at %d units (MT_SHORT_TEXT_MAX_UNITS); "
                     "remaining short lines used plain decoding",
                     self.short_text_max_units,
                 )
-            return "\n\n".join(out_paragraphs), segments
+            return join_units(units, [o or "" for o in outputs], target_language), len(units)
         finally:
             if self.free_vram:
                 self.release_vram()
@@ -331,6 +390,125 @@ class MTEngine:
             del logits, logp, token_lp, enc, lab, label_ids, label_mask
         return scores
 
+    def _translate_units(
+        self,
+        units: list[Unit],
+        *,
+        target_language: str,
+        num_beams: int,
+        length_penalty: float,
+        max_new_tokens: int,
+    ) -> list[str]:
+        """Decode units in padded batches, check every row, retry the bad ones once.
+
+        * a row that stopped without EOS is retried with a larger budget;
+        * a repetition loop is retried with beam search + no_repeat_ngram_size=4, and cut
+          back to one copy if it still runs into the budget;
+        * output in the wrong script (new Japanese text for ja->vi) or far too short for
+          its source is retried with 4 beams when it was decoded with fewer (with 4+
+          the retry would repeat the same search); the retry wins only if it is better;
+        * a packed unit (several spaced-script sentences) is re-translated sentence by
+          sentence when its output has an issue, misses 2+ sentences, or is clearly too
+          short for its source (``generation.pack_incomplete``).
+        """
+        texts = [unit.text for unit in units]
+        first = self._translate_batch(
+            texts,
+            target_language=target_language,
+            num_beams=num_beams,
+            length_penalty=length_penalty,
+            max_new_tokens=max_new_tokens,
+        )
+        results: list[GenResult] = list(first)
+        issues = [assess(text, res, target_language) for text, res in zip(texts, first)]
+
+        fallback: list[int] = []
+        retries: dict[str, list[int]] = {}
+        for i, unit in enumerate(units):
+            if unit.parts:
+                why = pack_incomplete(
+                    len(unit.parts), count_sentences(results[i].text), results[i], issues[i]
+                )
+                if why:
+                    logger.info(
+                        "MT pack of %d sentences re-translated one by one (%s%s): %r",
+                        len(unit.parts),
+                        why,
+                        f" {sorted(issues[i])}" if issues[i] else "",
+                        texts[i][:60],
+                    )
+                    fallback.append(i)
+                continue
+            kind = retry_kind(issues[i], results[i], max_new_tokens)
+            if kind == "beam" and num_beams >= _RETRY_BEAMS:
+                kind = None  # same beams, budget and settings: same output again
+            if kind:
+                retries.setdefault(kind, []).append(i)
+
+        for kind, idxs in retries.items():
+            again = self._translate_batch(
+                [texts[i] for i in idxs],
+                target_language=target_language,
+                num_beams=max(num_beams, _RETRY_BEAMS) if kind in ("loop", "beam") else num_beams,
+                length_penalty=length_penalty,
+                max_new_tokens=max_new_tokens,
+                longer=kind == "longer",
+                no_repeat_ngram_size=4 if kind == "loop" else 0,
+            )
+            for i, res in zip(idxs, again):
+                new_issues = assess(texts[i], res, target_language)
+                if kind == "longer":
+                    # Still cut off, but further along: the longer text keeps more.
+                    kept = severity(new_issues) > severity(issues[i])
+                else:
+                    kept = severity(new_issues) >= severity(issues[i])
+                logger.info(
+                    "MT retry (%s) %r: %s -> %s, kept %s",
+                    kind,
+                    texts[i][:60],
+                    sorted(issues[i]),
+                    sorted(new_issues),
+                    "first" if kept else "retry",
+                )
+                if not kept:
+                    results[i], issues[i] = res, new_issues
+
+        outputs: list[str] = []
+        for i, res in enumerate(results):
+            text = res.text
+            if i not in fallback and issues[i]:
+                if {"loop", "truncated"} <= issues[i]:
+                    text = trim_loop(text)
+                logger.warning(
+                    "MT output still %s (src=%d tok, out=%d tok, limit=%d): %r -> %r",
+                    sorted(issues[i]),
+                    res.src_len,
+                    res.out_tokens,
+                    res.limit,
+                    texts[i][:80],
+                    text[:80],
+                )
+            outputs.append(text)
+
+        if fallback:
+            parts = [part for i in fallback for part in units[i].parts]
+            logger.info(
+                "MT pack fallback: %d packed units -> %d sentences", len(fallback), len(parts)
+            )
+            decoded = self._translate_units(
+                parts,
+                target_language=target_language,
+                num_beams=num_beams,
+                length_penalty=length_penalty,
+                max_new_tokens=max_new_tokens,
+            )
+            pos = 0
+            for i in fallback:
+                n = len(units[i].parts)
+                outputs[i] = join_units(list(units[i].parts), decoded[pos : pos + n], target_language)
+                pos += n
+        return outputs
+
     def _translate_batch(
         self,
         batch: list[str],
@@ -339,94 +517,152 @@ class MTEngine:
         num_beams: int,
         length_penalty: float,
         max_new_tokens: int,
-    ) -> list[str]:
+        longer: bool = False,
+        no_repeat_ngram_size: int = 0,
+    ) -> list[GenResult]:
+        """Generate ``batch`` in padded chunks of up to ``batch_size`` rows.
+
+        Rows are sorted by length (little padding) and capped by ``batch_max_tokens``
+        KV-cache slots. T5 uses relative positions and the attention mask hides the right
+        padding, so a row decodes as it would alone (fp32: identical; bf16: rounding-level
+        differences only). Each row gets max(64, 2c+32) new tokens (c = source tokens),
+        or 4c+64 when ``longer``; ``max_new_tokens`` caps both.
+        """
         import torch
 
-        decoded: list[str] = []
-        for chunk in batch:
-            text = f"<2{target_language}> {chunk}"
-            # Same as the Hub card: tokenizer(text).input_ids.to(model.device)
-            input_ids = self.tokenizer(text, return_tensors="pt").input_ids.to(self._device())
-            src_len = int(input_ids.shape[-1])
-            gen_kwargs: dict = {
-                "input_ids": input_ids,
-                "max_new_tokens": min(max_new_tokens, max(48, src_len + 16)),
-            }
-            if num_beams > 1:
-                gen_kwargs["num_beams"] = max(1, min(num_beams, 5))
-                gen_kwargs["length_penalty"] = length_penalty
-                gen_kwargs["do_sample"] = False
-            outputs = self.model.generate(**gen_kwargs)
-            decoded.append(self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip())
-            del outputs, input_ids
+        tag = f"<2{target_language}>"
+        inputs = [f"{tag} {text}" for text in batch]
+        lengths = [self._token_len(text) for text in inputs]
+        budget = retry_budget if longer else output_budget
+        budgets = [budget(n, max_new_tokens) for n in lengths]
+        beams = max(1, min(num_beams, 5))
+        results: list[GenResult | None] = [None] * len(batch)
+        plan = plan_batches(
+            lengths,
+            budgets,
+            batch_size=self.batch_size,
+            num_beams=beams,
+            max_batch_tokens=self.batch_max_tokens,
+        )
+        queue = list(reversed(plan))
+        while queue:
+            rows = queue.pop()
+            limit = max(budgets[i] for i in rows)
+            try:
+                generated = self._generate(
+                    [inputs[i] for i in rows],
+                    max_new_tokens=limit,
+                    num_beams=beams,
+                    length_penalty=length_penalty,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                )
+            except Exception as exc:
+                if len(rows) == 1 or not _is_oom(exc):
+                    raise
+                # Shared 12GB card: another process grabbed memory. Halve and go on.
+                logger.warning("MT batch of %d rows hit CUDA OOM; splitting it", len(rows))
+                self._free_cuda()
+                half = len(rows) // 2
+                queue.extend([rows[half:], rows[:half]])
+                continue
+            for i, (text, finished, out_tokens) in zip(rows, generated):
+                results[i] = GenResult(text, finished, out_tokens, lengths[i], limit)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return decoded
+        return [res for res in results if res is not None]
 
-    def _segment(self, text: str) -> list[tuple[list[str], str]]:
-        """Split into paragraphs of translation units, each with the joiner to rebuild it.
+    def _generate(
+        self,
+        inputs: list[str],
+        *,
+        max_new_tokens: int,
+        num_beams: int,
+        length_penalty: float,
+        no_repeat_ngram_size: int = 0,
+    ) -> list[tuple[str, bool, int]]:
+        """One padded generate() call -> [(text, finished with EOS, generated tokens)]."""
+        device = self._device()
+        enc = self.tokenizer(inputs, return_tensors="pt", padding=True)
+        gen_kwargs: dict = {
+            "input_ids": enc.input_ids.to(device),
+            "attention_mask": enc.attention_mask.to(device),
+            "max_new_tokens": max_new_tokens,
+        }
+        if num_beams > 1:
+            gen_kwargs["num_beams"] = num_beams
+            gen_kwargs["length_penalty"] = length_penalty
+            gen_kwargs["do_sample"] = False
+        if no_repeat_ngram_size:
+            gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+        outputs = self.model.generate(**gen_kwargs)
+        eos_id = self.model.config.eos_token_id
+        pad_id = self.model.config.pad_token_id
+        rows = outputs.tolist()
+        decoded = self.tokenizer.batch_decode(rows, skip_special_tokens=True)
+        del outputs, enc, gen_kwargs
+        out: list[tuple[str, bool, int]] = []
+        for row, text in zip(rows, decoded):
+            finished, n_out = row_stats(row, eos_id, pad_id)
+            out.append((text.strip(), finished, n_out))
+        return out
 
-        * a paragraph that is a list of short terms (one per line) is translated line by
-          line, so "kite\\nkit\\ncape" is not fed to the model as one run-on phrase;
-        * otherwise a paragraph is one unit if it fits the encoder, else packed sentences.
-        Paragraphs are rejoined with a blank line.
+    def _segment(self, text: str, target_language: str) -> list[Unit]:
+        """Lines -> sentences -> units (see ``segmenter.split_text``).
+
+        Token budgets are measured with the real target tag. Spaced-script sentences are
+        packed up to ``segment_pack_tokens`` unless the target has no sentence
+        punctuation to check a pack's output against (Thai, Lao).
         """
-        paragraphs: list[tuple[list[str], str]] = []
-        for block in re.split(r"\n\s*\n", text):
-            if _WHITESPACE_ONLY.match(block):
-                continue
-            stripped = block.strip()
-            if self.short_text_rerank and is_word_list(stripped, self.short_text_max_words):
-                lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-                paragraphs.append((lines, "\n"))
-                continue
-            if self._token_len(f"<2en> {stripped}") <= self.max_input_tokens:
-                paragraphs.append(([stripped], " "))
-                continue
-            joiner = "\n" if "\n" in stripped else " "
-            paragraphs.append((self._pack_sentences(stripped), joiner))
-        return paragraphs
+        tag = f"<2{target_language}>"
+        pack = self.segment_pack_tokens
+        if target_base(target_language) in _NO_SENTENCE_PUNCT_TARGETS:
+            pack = 0
+        return split_text(
+            text,
+            token_len=lambda s: self._token_len(f"{tag} {s}"),
+            max_tokens=self.max_input_tokens,
+            clause_tokens=self.segment_clause_tokens,
+            pack_tokens=pack,
+        )
 
-    def _pack_sentences(self, paragraph: str) -> list[str]:
-        sentences = [part.strip() for part in _SENTENCE_SPLIT.split(paragraph) if part.strip()]
-        if not sentences:
-            return self._hard_split(paragraph)
+    def _rerank_lines(self, units: list[Unit]) -> frozenset[int]:
+        """Lines whose whole-line unit may get the short-text rerank.
 
-        packed: list[str] = []
-        current = ""
-        prefix_budget = self.max_input_tokens
-        for sentence in sentences:
-            candidate = sentence if not current else f"{current} {sentence}"
-            if self._token_len(f"<2en> {candidate}") <= prefix_budget:
-                current = candidate
-                continue
-            if current:
-                packed.append(current)
-            if self._token_len(f"<2en> {sentence}") <= prefix_budget:
-                current = sentence
-            else:
-                packed.extend(self._hard_split(sentence))
-                current = ""
-        if current:
-            packed.append(current)
-        return packed
+        As before segmentation existed: a line that is a blank-line block of its own (the
+        whole input "kite", a title paragraph), or a line of a block whose every line is a
+        short term (a vocabulary list "kite\\ncape\\nkit"). Short lines of a letter or a
+        paragraph ("Hi John,", "Best regards,", "Anna") keep plain decoding.
+        """
+        sources = line_sources(units)
+        blocks: dict[int, list[int]] = {}
+        for unit in units:
+            lines = blocks.setdefault(unit.block, [])
+            if unit.line not in lines:
+                lines.append(unit.line)
+        eligible: set[int] = set()
+        for lines in blocks.values():
+            text = "\n".join(sources[line] for line in lines)
+            if len(lines) == 1 or is_word_list(text, self.short_text_max_words):
+                eligible.update(lines)
+        return frozenset(eligible)
 
-    def _hard_split(self, text: str) -> list[str]:
-        words = text.split()
-        if not words:
-            return [text]
-        pieces: list[str] = []
-        current: list[str] = []
-        for word in words:
-            candidate = " ".join(current + [word])
-            if current and self._token_len(f"<2en> {candidate}") > self.max_input_tokens:
-                pieces.append(" ".join(current))
-                current = [word]
-            else:
-                current.append(word)
-        if current:
-            pieces.append(" ".join(current))
-        return pieces
+    @staticmethod
+    def _lookup_lines(
+        units: list[Unit], outputs: list[str | None], lookup: Callable[[str], str | None]
+    ) -> None:
+        """Glossary entries match whole lines too, even when the line was split."""
+        members: dict[int, list[int]] = {}
+        for i, unit in enumerate(units):
+            members.setdefault(unit.line, []).append(i)
+        sources = line_sources(units)
+        for line_no, idxs in members.items():
+            if len(idxs) < 2:
+                continue  # a one-unit line is looked up per unit
+            hit = lookup(sources[line_no])
+            if hit is not None:
+                outputs[idxs[0]] = hit
+                for i in idxs[1:]:
+                    outputs[i] = ""
 
     def _token_len(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=True))

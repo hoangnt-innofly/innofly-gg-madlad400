@@ -1,8 +1,31 @@
 {
-  "_comment": "Fixed translations that override MADLAD. Section key: \"<source>-><target>\" or just \"<target>\" (any source). A term matches only when it is the whole input / line / paragraph (case-insensitive, trailing punctuation ignored). Edits are picked up without restarting.",
+  "_comment": "Fixed translations that override MADLAD. Section key: \"<source>-><target>\" or just \"<target>\" (any source). A term matches only when it is the whole input, a whole line, a heading label or one translation unit of a line (case-insensitive, trailing punctuation ignored). Edits are picked up without restarting.",
   "en->vi": {
     "kite": "con diều",
     "kit": "bộ dụng cụ",
     "cape": "áo choàng"
+  },
+  "_comment_labels": "Heading labels ('テーマ：…'). Alone, MADLAD reads テーマ as 'Sắc thái' and 'テーマ：X' as the wiki namespace 'Bản mẫu:X'.",
+  "ja->vi": {
+    "テーマ": "Chủ đề",
+    "タイトル": "Tiêu đề",
+    "題名": "Tiêu đề",
+    "例": "Ví dụ",
+    "答え": "Đáp án",
+    "注意": "Lưu ý",
+    "目的": "Mục đích",
+    "結論": "Kết luận",
+    "質問": "Câu hỏi"
+  },
+  "ja->en": {
+    "テーマ": "Theme",
+    "タイトル": "Title",
+    "題名": "Title",
+    "例": "Example",
+    "答え": "Answer",
+    "注意": "Note",
+    "目的": "Purpose",
+    "結論": "Conclusion",
+    "質問": "Question"
   }
 }

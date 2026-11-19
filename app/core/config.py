@@ -30,11 +30,24 @@ class Settings(BaseSettings):
 
     mt_default_source_language: str = DEFAULT_SOURCE_LANGUAGE
     mt_default_target_language: str = DEFAULT_TARGET_LANGUAGE
-    mt_default_num_beams: int = 1
+    mt_default_num_beams: int = 4
     mt_default_length_penalty: float = 1.0
     mt_default_max_new_tokens: int = 512
     mt_default_max_input_tokens: int = 480
+    # Sentences decoded together per generate() call (padded, sorted by length).
     mt_default_batch_size: int = 4
+    # Cap per generate() call in KV-cache token slots: rows * beams * (source + output).
+    # ~256 KiB per slot for MADLAD-3B in bf16, so 4096 is ~1 GiB.
+    mt_batch_max_tokens: int = 4096
+
+    # Segmentation. Every line and every sentence is its own model input (MADLAD drops
+    # sentences from multi-sentence input). Consecutive sentences of a spaced script
+    # (en, vi, de, ...) on one line are packed up to this many tokens because MADLAD keeps
+    # them and uses the context; a pack whose output looks incomplete is re-translated
+    # sentence by sentence. 0 = one sentence per input everywhere. CJK is never packed.
+    mt_segment_pack_tokens: int = 256
+    # Thai/Lao lines (no sentence punctuation) longer than this are cut at spaces.
+    mt_segment_clause_tokens: int = 96
 
     # Lone words / tiny phrases ("kite", "kit", "cape"): MADLAD is sentence-level and greedy
     # decoding gives garbage ("đi đi") or copies the word. For input of at most

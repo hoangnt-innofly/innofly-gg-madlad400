@@ -262,6 +262,9 @@ class JobService:
                     short_text_copy_penalty=self.settings.mt_short_text_copy_penalty,
                     short_text_repeat_penalty=self.settings.mt_short_text_repeat_penalty,
                     short_text_max_units=self.settings.mt_short_text_max_units,
+                    segment_pack_tokens=self.settings.mt_segment_pack_tokens,
+                    segment_clause_tokens=self.settings.mt_segment_clause_tokens,
+                    batch_max_tokens=self.settings.mt_batch_max_tokens,
                 )
             if not getattr(self._engine, "ready", False):
                 try:
