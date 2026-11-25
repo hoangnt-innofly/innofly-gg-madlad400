@@ -124,6 +124,14 @@ def call(url: str, key: str, probe: dict, pivot: bool | None) -> tuple[dict, flo
     started = time.perf_counter()
     with urllib.request.urlopen(req, timeout=660) as resp:
         body = json.load(resp)
+    # 202: still queued / running behind other jobs after the server's 600 s wait.
+    while body.get("status") in ("queued", "running") and time.perf_counter() - started < 1800:
+        time.sleep(3)
+        poll = urllib.request.Request(
+            f"{url.rstrip('/')}/api/v1/jobs/{body['job_id']}", headers={"api-key": key}
+        )
+        with urllib.request.urlopen(poll, timeout=60) as resp:
+            body = json.load(resp)
     return body, time.perf_counter() - started
 
 
@@ -156,6 +164,10 @@ def main() -> int:
                 body, secs = call(args.url, args.key, probe, pivot)
             except urllib.error.HTTPError as exc:
                 print(f"ERROR {probe['name']} [{label}]: HTTP {exc.code} {exc.read()[:200]!r}")
+                failed += label == "rule"
+                continue
+            if body.get("status") != "succeeded":
+                print(f"ERROR {probe['name']} [{label}]: job {body.get('status')} {body.get('error') or ''}")
                 failed += label == "rule"
                 continue
             out = body.get("translation") or ""

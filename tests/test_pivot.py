@@ -34,6 +34,13 @@ from app.services.pivot import route_unit
         ("日本の大学生活は楽しいです。", "ja", "vi", False, "direct"),
         ("Hello world.", None, "vi", True, "pivot"),
         ("Tôi là sinh viên.", "auto", "vi", None, "copy"),  # accents + Vietnamese syllables
+        # Latin source naming / resembling Vietnamese: never copied
+        ("I live in Hà Nội.", "en", "vi", None, "direct"),
+        ("My teacher is Mr. Nguyễn.", "en", "vi", False, "direct"),
+        ("Il habite à Hà Nội depuis 2010.", "fr", "vi", None, "pivot"),
+        ("Não sei.", "pt", "vi", None, "pivot"),
+        ("Sí", "es", "vi", None, "pivot"),
+        ("Ghi chú: đây là câu ví dụ.", "en", "vi", None, "direct"),
         ("Ghi chú", "ja", "vi", None, "copy"),
         ("Café de Paris été", "fr", "vi", None, "pivot"),  # accents, but not Vietnamese
     ],

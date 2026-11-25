@@ -179,8 +179,10 @@ class JobService:
         While a job is translating, the release is deferred until it ends (unloading in
         the middle of generate() would fail that job).
         """
+        # Flag first: a job ending between the failed acquire and the flag write would
+        # otherwise never see the request.
+        self._release_pending = True
         if not self._run_lock.acquire(blocking=False):
-            self._release_pending = True
             return {"freed": False, "deferred": True}
         try:
             self._release()
@@ -189,12 +191,12 @@ class JobService:
         return {"freed": True}
 
     def _release(self) -> None:
-        self._release_pending = False
         with self._engine_lock:
             if self._engine is not None:
                 self._engine.release_vram()
             else:
                 self._free_cuda()
+        self._release_pending = False
 
     def cuda_info(self) -> tuple[bool, str | None]:
         try:

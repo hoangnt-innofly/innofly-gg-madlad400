@@ -217,6 +217,17 @@ def detect_language_info(text: str) -> tuple[str, bool]:
         return _langdetect_guess(sample) or "en", False
 
     guess = _langdetect_guess(sample)
+    # Latin-majority text that still has kana / Hangul / a fair Han share ("このエラーは
+    # TypeError: Cannot read properties of undefined です") is a CJK text with English
+    # terms: a langdetect "en" there must not skip it as same-language.
+    shares = _script_shares(sample[:4000])
+    asian = bool(_SCRIPTS[0][1].search(sample) or _SCRIPTS[1][1].search(sample))
+    if asian or shares.get("cjk", 0.0) >= 0.3:
+        return guess or "en", False
+    if guess == "vi":
+        # langdetect reads accents of a Vietnamese dish or name as Vietnamese ("We love
+        # phở and bánh mì."); unless the text really looks Vietnamese, only a guess.
+        return guess, False
     return guess or "en", guess is not None
 
 
@@ -292,7 +303,7 @@ def script_language(sample: str) -> tuple[str | None, bool]:
         return None, False
     top = max(shares, key=lambda k: shares[k])
     decisive = shares[top] >= DECISIVE_SHARE
-    if top == "latin" and not _VI_CHARS.search(sample):
+    if top == "latin" and not looks_vietnamese(sample):
         # English terms inside CJK text ("React Hooksのuseeffectについて"): Latin letters
         # outnumber the kana, but English prose quoting a word ("He is a 先生") keeps
         # the CJK share low.
@@ -305,20 +316,33 @@ def script_language(sample: str) -> tuple[str | None, bool]:
     if top == "hangul":
         return "ko", decisive
     if top == "latin":
-        return ("vi" if _VI_CHARS.search(sample) else None), decisive
+        return ("vi" if looks_vietnamese(sample) else None), decisive
     return top, decisive
 
 
+# looks_vietnamese: share of words that must be Vietnamese syllables, and share that must
+# carry a Vietnamese accent. One accented name does not make a sentence Vietnamese:
+# "I live in Hà Nội." is 4/5 syllables ("i", "in" parse too), "Não sei." 1/2 accented.
+VI_SYLLABLE_SHARE = 0.9
+VI_ACCENTED_SHARE = 0.3
+# Words counted by looks_vietnamese: those with a Latin letter (not digits, not 休).
+_LATIN_WORD = re.compile(r"[A-Za-zÀ-ɏḀ-ỿ]")
+
+
 def looks_vietnamese(text: str) -> bool:
-    """Written in Vietnamese beyond doubt: a Vietnamese-only letter (ơ, ư, đ, ạ ...), or
-    Vietnamese accents on words that are all Vietnamese syllables ("Ghi chú", "Tôi là
-    sinh viên"). Plain ASCII never counts ("can you go" parses as syllables too)."""
-    if _VI_ONLY_CHARS.search(text):
-        return True
-    words = _WORD.findall(text)
-    return bool(_VI_CHARS.search(text)) and bool(words) and all(
-        w.isdigit() or _is_vi_syllable(w) for w in words
-    )
+    """Written in Vietnamese: almost every word is a Vietnamese syllable and a fair share
+    carry Vietnamese accents ("Ghi chú", "Tôi là sinh viên", "Hôm nay trời mưa to").
+
+    Strict on purpose: an English / French sentence naming "Hà Nội" or "Mr. Nguyễn" is
+    not Vietnamese, and plain ASCII never counts. A miss only means the text is left to
+    langdetect / translated rather than copied.
+    """
+    words = [w for w in _WORD.findall(text) if _LATIN_WORD.search(w)]
+    if not words:
+        return False
+    syllables = sum(1 for w in words if _is_vi_syllable(w))
+    accented = sum(1 for w in words if _VI_CHARS.search(w))
+    return syllables >= VI_SYLLABLE_SHARE * len(words) and accented >= VI_ACCENTED_SHARE * len(words)
 
 
 def _detect_script(sample: str) -> str | None:

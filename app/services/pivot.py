@@ -71,14 +71,27 @@ def route_unit(
     lang, decisive = script_language(text)
     if lang == "vi" and not looks_vietnamese(text):
         lang = None  # é / à / ô of French, Portuguese ...: Latin of unknown language
+    src_latin = bool(src) and src not in _NON_LATIN_SOURCES
+    tgt_latin = tgt not in _NON_LATIN_SOURCES
     written = _WRITTEN_IN.get(tgt)
-    if decisive and lang == tgt and src != tgt and written is not None and written(text):
+    # Never between two Latin-script languages: "Sí", "Não sei", "I live in Hà Nội" are
+    # the source language naming / resembling Vietnamese, not Vietnamese notes.
+    if (
+        decisive
+        and lang == tgt
+        and src != tgt
+        and not (src_latin and tgt_latin)
+        and written is not None
+        and written(text)
+    ):
         return "copy"
+    if src_latin and lang in (None, "vi") and src != tgt:
+        lang = src  # Latin text of a Latin-script source is in the source language
     if requested is False or not tgt or tgt == PIVOT_LANGUAGE:
         return "direct"
     if requested:
         return "pivot"
-    unit_src = lang or (src if src and src not in _NON_LATIN_SOURCES else "")
+    unit_src = lang or ""
     if not unit_src or unit_src in (PIVOT_LANGUAGE, tgt):
         return "direct"
     return "pivot"
