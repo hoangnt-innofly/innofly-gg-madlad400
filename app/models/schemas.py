@@ -14,6 +14,7 @@ class JobResponse(BaseModel):
     model: str = "google/madlad400-3b-mt"
     mode: str = "mt"
     num_beams: int | None = None
+    pivot_language: str | None = None
     chunks: int | None = None
     error: str | None = None
     progress: str | None = None

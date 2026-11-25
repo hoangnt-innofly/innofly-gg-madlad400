@@ -100,6 +100,9 @@ class MTEngine:
         self.tokenizer = None
         self.sp = None
         self._ready = False
+        # Pivot language the last translate() call really used (None: every unit was
+        # direct, a glossary hit or a short-text rerank). Jobs run one at a time.
+        self.last_pivot: str | None = None
 
     @property
     def ready(self) -> bool:
@@ -172,12 +175,16 @@ class MTEngine:
         length_penalty: float = 1.0,
         max_new_tokens: int = 512,
         lookup: Callable[[str], str | None] | None = None,
+        pivot_language: str | None = None,
     ) -> tuple[str, int]:
         """Translate ``text``; returns (translation, number of segments).
 
         ``source_language`` is optional (MADLAD only needs the target tag); when known it
         enables back-translation scoring for short input. ``lookup`` is a glossary hook
         tried on every line that was split, then on every unit, before the model.
+        ``pivot_language`` (see ``pivot.choose_pivot``): units decoded by the model go
+        source -> pivot -> target (``_translate_pivot``); glossary hits and the short-text
+        rerank are unchanged.
 
         The text is cut into lines and sentences (``segmenter.split_text``): MADLAD is a
         sentence-level model and drops sentences, or writes new source-language text,
@@ -202,6 +209,7 @@ class MTEngine:
         outputs: list[str | None] = [None] * len(units)
         if lookup:
             self._lookup_lines(units, outputs, lookup)
+        self.last_pivot = None
         rerank_lines = self._rerank_lines(units) if self.short_text_rerank else frozenset()
         pending: list[int] = []
         reranked = 0
@@ -237,13 +245,18 @@ class MTEngine:
                     else:
                         pending.append(i)
                 if pending:
-                    decoded = self._translate_units(
-                        [units[i] for i in pending],
+                    decoding = dict(
                         target_language=target_language,
                         num_beams=num_beams,
                         length_penalty=length_penalty,
                         max_new_tokens=max_new_tokens,
                     )
+                    if pivot_language:
+                        decoded = self._translate_pivot(
+                            [units[i] for i in pending], pivot_language=pivot_language, **decoding
+                        )
+                    else:
+                        decoded = self._translate_units([units[i] for i in pending], **decoding)
                     for i, out in zip(pending, decoded):
                         outputs[i] = out
             if self.short_text_rerank and reranked >= self.short_text_max_units > 0:
@@ -507,6 +520,84 @@ class MTEngine:
                 n = len(units[i].parts)
                 outputs[i] = join_units(list(units[i].parts), decoded[pos : pos + n], target_language)
                 pos += n
+        return outputs
+
+    def _translate_pivot(
+        self,
+        units: list[Unit],
+        *,
+        pivot_language: str,
+        target_language: str,
+        num_beams: int,
+        length_penalty: float,
+        max_new_tokens: int,
+    ) -> list[str]:
+        """source -> pivot -> target, one output per unit (see ``pivot.choose_pivot``).
+
+        Stage 1 decodes the units into the pivot language with all of
+        ``_translate_units``' checks (retries, pack fallback). Each intermediate text is
+        then segmented like a request in the pivot language (sentences, packs, long
+        pieces), all of them are decoded into the target in one batched pass, and each
+        unit's pieces are joined back. A unit whose intermediate came back empty is
+        translated directly.
+        """
+        decoding = dict(num_beams=num_beams, length_penalty=length_penalty, max_new_tokens=max_new_tokens)
+        middle = self._translate_units(units, target_language=pivot_language, **decoding)
+
+        stage: list[Unit] = []
+        spans: list[tuple[int, int] | None] = []
+        direct: list[int] = []
+        for i, mid in enumerate(middle):
+            sub = self._segment(mid, target_language) if mid.strip() else []
+            if not sub:
+                direct.append(i)
+                spans.append(None)
+                continue
+            spans.append((len(stage), len(stage) + len(sub)))
+            stage.extend(sub)
+
+        todo = [k for k, unit in enumerate(stage) if unit.translate]
+        stage_out = [unit.text for unit in stage]  # symbols / numbers only: copied
+        if todo:
+            for k, out in zip(
+                todo,
+                self._translate_units(
+                    [stage[k] for k in todo], target_language=target_language, **decoding
+                ),
+            ):
+                stage_out[k] = out
+
+        if len(direct) < len(units):
+            self.last_pivot = pivot_language
+        outputs: list[str] = []
+        for i, span in enumerate(spans):
+            if span is None:
+                outputs.append("")
+                continue
+            a, b = span
+            outputs.append(join_units(stage[a:b], stage_out[a:b], target_language))
+            logger.debug("MT pivot %r -> %r -> %r", units[i].text[:60], middle[i][:60], outputs[-1][:60])
+        if direct:
+            logger.warning(
+                "MT pivot (%s) gave no text for %d units; translating them directly",
+                pivot_language,
+                len(direct),
+            )
+            for i, out in zip(
+                direct,
+                self._translate_units(
+                    [units[i] for i in direct], target_language=target_language, **decoding
+                ),
+            ):
+                outputs[i] = out
+        logger.info(
+            "MT pivot via %s: %d units -> %d %s pieces -> %s",
+            pivot_language,
+            len(units),
+            len(stage),
+            pivot_language,
+            target_language,
+        )
         return outputs
 
     def _translate_batch(

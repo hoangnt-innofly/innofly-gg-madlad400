@@ -52,6 +52,7 @@ Multipart fields:
 | `num_beams` | no | `1`–`8`, default `4` |
 | `length_penalty` | no | Default `1.0` |
 | `max_new_tokens` | no | Per chunk, default `512` |
+| `pivot` | no | `true` / `false`: force translating through English on / off. Omitted = server rule (see *Pivot through English*) |
 
 ```json
 {
@@ -65,6 +66,7 @@ Multipart fields:
   "model": "google/madlad400-3b-mt",
   "mode": "mt",
   "num_beams": 4,
+  "pivot_language": null,
   "chunks": 1,
   "error": null
 }
@@ -122,6 +124,7 @@ MADLAD-400 is trained on sentence pairs. Sent a title line plus seven sentences 
 
 1. keeps every line separate (titles, list items, dialogue lines) and copies the line breaks, blank lines and indentation (full-width space U+3000) of the source into the output (U+2028, U+2029, VT, FF and NEL count as line breaks and come out as `
 `); a sentence that an e-mail client hard-wrapped is merged back (spaced scripts: the next line starts in lower case; CJK: 2+ lines that do not end a sentence share one fixed length, so a title line or chat messages of similar length stay separate);
+   A run of 2+ spaces / tabs / U+3000 between Han / Kana text also ends a piece and is copied into the output: Japanese and Chinese put no spaces inside a sentence, so it is a lost line break (`テーマ：日本の大学生活  日本の大学生活は、…` = a title, then the first sentence; sent as one input MADLAD merged them and invented content). A single space (`山田　太郎`, `東京都 港区`) is left alone;
 2. translates a heading line `LABEL：content` / `LABEL: content` as two units, the label alone and the content alone. Sent whole, `テーマ：環境問題と私たちの生活` came back as `Bản mẫu:Công nghiệp và môi trường` (MADLAD read it as the wiki namespace "Template:"); the content alone translates correctly. The label gets the glossary (`ja->vi`: `テーマ` → `Chủ đề`; bare `テーマ` alone gives `Sắc thái`), else the short-text rerank, else plain decoding. If the content is a single short unit it gets the short-text rerank like a whole line (`kite` of `Word: kite`). Output: `label: content`, or `label：content` for `ja` / `zh` / `yue` when the translated label has a CJK character (`問1：`). A bullet in front of the label (`・テーマ：…`, `■注意：…`, `# Theme: …`) is copied as is and is not part of the label. A label is at most 6 CJK characters or 2 words with no sentence punctuation; times, ratios and URLs (`10:30`, `1:2`, `http://`), `Q: …` and longer clauses before a colon stay whole;
 3. splits each line into sentences: `。！？` and other script stops split even without a following space; `.!?` need a space, or CJK / Hangul on both sides (`我很好.你呢`). These do not split: abbreviations with or without a space after them (`Mr.`, `Mr.田中`, `U.S.出身`, `Inc.の`, `z.B.`, `No. 5`, `Jan. 5`, `Mt. Fuji`), ordinals (`am 24. Dezember`, `1. Dünya`; 4-digit years still end a sentence), decimals, initials, list markers, and a closing quote glued to the next word (`「行こう。」と言った。`, `"Hi!"라고 말했다.`, `“我来了。”他说。`);
 4. never packs CJK / Korean / Thai-like sentences together; consecutive sentences of a spaced script (`en`, `vi`, `de`, …) on one line are packed up to `MT_SEGMENT_PACK_TOKENS` (default 256) because MADLAD keeps them and uses the context. A pack is re-translated sentence by sentence only when its output misses 2+ sentences, misses one and is under 75% of the source length in tokens, is under 50% whatever its sentence count, or has a retry issue (loop, wrong script, cut off). One sentence short at full length usually means two sentences were joined in the target, so that translation is kept. `0` = one sentence per input everywhere;
@@ -136,6 +139,14 @@ Units are decoded in padded `generate()` calls of up to `MT_DEFAULT_BATCH_SIZE` 
 | wrong script (Japanese out for `vi`), or < 30% of the source length | `num_beams=4`, only when the request used fewer beams (at 4+ the retry would repeat the same search; the row is just logged) |
 
 A retry is kept only if it is better; anything still wrong is logged (`MT output still …`).
+
+### Pivot through English
+
+MADLAD-400 3B is strong into and out of English but weak between two other languages. Live ja→vi, sentence by sentence, the direct output invented content (`大学生になると、自分で授業を選び、時間割を作ることができます。` → `Sau khi tốt nghiệp, sinh viên có thể tự lựa chọn ngành học…`) and replaced the subject of `私は、…必要だと思います。` with `các trường đại học`; ja→en was exact and en→vi of that English kept meaning and subject (`Tôi nghĩ là cần thiết phải…`).
+
+So when the source language is known (explicit, or a reliable detection) and neither the source nor the target is English, every unit decoded by the model goes source → en → target (`app/services/pivot.py`, `MTEngine._translate_pivot`). Stage 1 runs with all the usual checks and retries; each English intermediate is then segmented like an English request (sentences, packs) and decoded into the target in one batched pass. Glossary hits and the short-text rerank are unchanged (still direct). Cost: about 2× decoding time. The response field `pivot_language` is the pivot that at least one unit really went through (`null` when everything was direct, a glossary hit or a short-text rerank).
+
+A request can force it with `pivot=true` / `pivot=false` (no environment variable: the rule is fixed in code; live probes over 12 pairs gave 40 serious errors direct vs 9 through English).
 
 ### Single words / short phrases
 

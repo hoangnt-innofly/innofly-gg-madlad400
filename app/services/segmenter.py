@@ -351,11 +351,99 @@ def _glued_weak_split(line: str, at: int, stop_run: str, closers: str, nxt: str)
     return bool(_CJK_SCRIPT.match(prev)) and bool(nxt) and bool(_CJK_SCRIPT.match(nxt))
 
 
+# A run of 2+ spaces / tabs / U+3000 between Han / Kana text: Japanese and Chinese put no
+# spaces inside a sentence, so such a gap is a line break that was lost when the text was
+# pasted ("テーマ：日本の大学生活  日本の大学生活は、…" = a title, then the first sentence).
+# Sent as one input, MADLAD merged the title into the sentence and invented content. One
+# space is left alone: names and addresses ("山田　太郎", "東京都 港区") use it.
+_HAN_KANA_CHARS = "぀-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ"
+_GAP = re.compile(
+    r"(?<=[%s」』）】〉》〕\]\)])[ \t　]{2,}(?=[%s「『（【〈《〔\[\(])"
+    % (_HAN_KANA_CHARS, _HAN_KANA_CHARS)
+)
+
+
+_HAN_KANA_1 = re.compile("[%s]" % _HAN_KANA_CHARS)
+_GAP_CLOSERS = "」』）】〉》〕])"
+_GAP_OPENERS = "「『（【〈《〔[("
+_GAP_SEP = re.compile(r"[ \t　]{2,}")
+
+
+def _depths(line: str) -> list[int]:
+    """Bracket / quote depth before each character (same rules as ``_boundaries``)."""
+    out: list[int] = []
+    depth = 0
+    quote = False
+    for ch in line:
+        out.append(depth)
+        if ch in PAIRS:
+            depth += 1
+        elif ch in CLOSE_TO_OPEN and depth > 0:
+            depth -= 1
+        elif ch == '"':
+            depth += -1 if quote else 1
+            quote = not quote
+    return out + [depth]
+
+
+def _gap_cuts(line: str) -> list[int]:
+    """Ends of the ``_GAP`` runs that separate two pieces of Han / Kana text.
+
+    Brackets around the gap are stepped over ("（注）  本文", "「はい」  「いいえ」"), but
+    the text next to them must be Han / Kana on both sides: "See figure (a)  (b)" is
+    one sentence. A gap inside 「…」 / (…) is not a break ("「東京  大阪」に行った。"),
+    unless the line's brackets are unbalanced (then they are ignored, as in
+    ``split_sentences``).
+    """
+    matches = list(_GAP.finditer(line))
+    if not matches:
+        return []
+    depth = _depths(line)
+    balanced = depth[-1] == 0
+    cuts: list[int] = []
+    for m in matches:
+        left = line[: m.start()].rstrip(_GAP_CLOSERS)[-1:]
+        right = line[m.end() :].lstrip(_GAP_OPENERS)[:1]
+        if not (_HAN_KANA_1.match(left) and _HAN_KANA_1.match(right)):
+            continue
+        if balanced and depth[m.start()] > 0:
+            continue
+        cuts.append(m.end())
+    return cuts
+
+
+def _split_gaps(line: str) -> list[tuple[str, str]]:
+    """Line -> [(segment, gap whitespace after it)] at ``_gap_cuts``."""
+    out: list[tuple[str, str]] = []
+    start = 0
+    for cut in _gap_cuts(line) + [len(line)]:
+        piece = line[start:cut]
+        body = piece.rstrip(" \t　")
+        if body:
+            out.append((body, piece[len(body):]))
+        start = cut
+    return out
+
+
+def _is_gap(unit: "Unit") -> bool:
+    """Did ``unit`` end at a ``_GAP`` (not at a sentence stop followed by spaces)?"""
+    return (
+        not unit.label
+        and bool(_GAP_SEP.fullmatch(unit.sep))
+        and bool(_HAN_KANA_1.match(unit.text.rstrip(_GAP_CLOSERS)[-1:]))
+    )
+
+
 def split_sentences(line: str) -> list[tuple[str, str]]:
-    """One line (no newline) -> [(sentence, whitespace after it)]."""
+    """One line (no newline) -> [(sentence, whitespace after it)].
+
+    Besides sentence stops, a 2+ whitespace gap between Han / Kana text ends a piece
+    (``_GAP``); its whitespace is the piece's separator, so ``join_units`` can copy it.
+    """
     cuts, depth = _boundaries(line, track_brackets=True)
     if depth != 0:  # unbalanced quotes/brackets: ignore them rather than never splitting
         cuts, _ = _boundaries(line, track_brackets=False)
+    cuts = sorted(set(cuts) | set(_gap_cuts(line)))
     out: list[tuple[str, str]] = []
     start = 0
     for cut in cuts + [len(line)]:
@@ -689,16 +777,31 @@ def split_text(
             lead = line[: m.end()] + rest[: len(rest) - len(rest.lstrip())]
             line = line[len(lead):]
         line_units: list[Unit] = []
-        heading = split_heading(line)
-        if heading:
-            label, colon, line = heading
-            line_units.append(
-                Unit(text=label, sep=colon, lead=lead, whole_line=False, line=line_no, block=block, label=True)
-            )
-            lead = ""
-        sentences = split_sentences(line)
-        for idx, (sent, sep) in enumerate(sentences):
-            last = idx == len(sentences) - 1
+        # A gap between Han / Kana text is a lost line break: each segment gets its own
+        # heading check ("目次  第１章：はじめに", "大学生活  テーマ：大学").
+        segments = _split_gaps(line) or [(line, "")]
+        # (text, separator after it, is a heading label), in order.
+        items: list[tuple[str, str, bool]] = []
+        heading = False
+        for seg_no, (segment, gap) in enumerate(segments):
+            seg_heading = split_heading(segment)
+            if seg_heading:
+                heading = len(segments) == 1
+                label, colon, segment = seg_heading
+                items.append((label, colon, True))
+            seg_sentences = split_sentences(segment)
+            if seg_sentences and seg_no < len(segments) - 1:
+                seg_sentences[-1] = (seg_sentences[-1][0], gap)
+            items.extend((body, sep, False) for body, sep in seg_sentences)
+        n_items = len(items)
+        for idx, (sent, sep, is_label) in enumerate(items):
+            last = idx == n_items - 1
+            if is_label:
+                line_units.append(
+                    Unit(text=sent, sep=sep, lead=lead, whole_line=False, line=line_no, block=block, label=True)
+                )
+                lead = ""
+                continue
             pieces = [sent]
             if _THAI_LAO.search(sent) and not any(c in sent for c in ".!?") and tl(sent) > clause_tokens and " " in sent:
                 pieces = _pack(sent.split(" "), lambda a, b: " ", lambda s: tl(s) <= clause_tokens)
@@ -712,13 +815,14 @@ def split_text(
                     Unit(
                         text=piece,
                         sep=psep,
-                        lead=lead if (idx == 0 and pidx == 0) else "",
+                        lead=lead if pidx == 0 else "",
                         translate=bool(_LETTER.search(piece)),
                         whole_line=False,
                         line=line_no,
                         block=block,
                     )
                 )
+            lead = ""
         if pack_tokens > 0 and len(line_units) > 1:
             line_units = _pack_line(line_units, tl, min(pack_tokens, max_tokens))
         if len(line_units) == 1 or (heading and len(line_units) == 2):
@@ -772,13 +876,16 @@ def join_units(units: list[Unit], outputs: list[str], target_language: str) -> s
     ("問1：", "ステップ1："), else by ": " (the source colon is not copied: "Chủ đề: ..."
     for テーマ：...).
     The colon is only written when content follows, so a line-level glossary hit put in
-    the label's slot stays as it is. Empty outputs leave no double spaces.
+    the label's slot stays as it is. Empty outputs leave no double spaces. A 2+ character
+    whitespace gap of the source (``_GAP``: a title and a sentence on one line) is copied
+    (U+3000 as a plain space unless the target is written without spaces).
     """
     no_space = target_base(target_language) in NO_SPACE_TARGETS
     chunks: list[str] = []
     line: list[str] = []
     after_label = False
     label_cjk = False
+    gap = ""
     for i, (unit, out) in enumerate(zip(units, outputs)):
         out = (out or "").strip()
         if unit.label:
@@ -789,11 +896,15 @@ def join_units(units: list[Unit], outputs: list[str], target_language: str) -> s
                 cjk = no_space and _cjk_edge(line[-1][-1])
                 if after_label:
                     line.append("：" if label_cjk else ": ")
+                elif gap:
+                    line.append(gap if no_space else gap.replace("　", " "))
                 else:
                     line.append("" if cjk else " ")
             line.append(piece)
             after_label = unit.label and bool(out)
             label_cjk = no_space and bool(_CJK.search(out))
+        if piece or not line:
+            gap = unit.sep if _is_gap(unit) else ""
         last = i == len(units) - 1
         if last or "\n" in unit.sep:
             chunks.append("".join(line))

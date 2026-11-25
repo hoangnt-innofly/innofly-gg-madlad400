@@ -465,3 +465,83 @@ def test_batch_size_and_token_cap_are_respected():
     engine.translate(text="".join(sentences), target_language="vi", num_beams=4)
     assert all(len(c["sources"]) == 1 for c in model.calls)
     assert all(c["num_beams"] == 4 for c in model.calls)
+
+
+# --------------------------------------------------------------------------- pivot
+
+PIVOT_JA_EN = {
+    "日本の大学生活": "University life in Japan",
+    "日本の大学生活は、高校までの生活とは大きく違います。":
+        "University life in Japan is very different from life up to high school.",
+    "私は、新しいことに挑戦することが必要だと思います。":
+        "I think it is necessary to try new things. That is my opinion.",
+    "２０２４年。": "2024.",
+}
+PIVOT_EN_VI = {
+    "University life in Japan": "Cuộc sống đại học ở Nhật Bản",
+    "University life in Japan is very different from life up to high school.":
+        "Cuộc sống đại học ở Nhật Bản rất khác với cuộc sống thời trung học.",
+    "I think it is necessary to try new things. That is my opinion.":
+        "Tôi nghĩ cần phải thử những điều mới. Đó là ý kiến của tôi.",
+}
+
+
+def pivot_model(source, target, kwargs):
+    if target == "en":
+        return PIVOT_JA_EN.get(source, "")
+    if target == "vi":
+        return PIVOT_EN_VI.get(source, f"[direct {source}]")
+    raise AssertionError(target)
+
+
+def test_pivot_goes_through_english_and_keeps_layout():
+    engine, model = make_engine(pivot_model)
+    text = "テーマ：日本の大学生活  日本の大学生活は、高校までの生活とは大きく違います。私は、新しいことに挑戦することが必要だと思います。"
+    out, segments = engine.translate(
+        text=text, target_language="vi", num_beams=1, lookup=GLOSSARY_JA_VI.get, pivot_language="en"
+    )
+    assert out == (
+        "Chủ đề: Cuộc sống đại học ở Nhật Bản  "
+        "Cuộc sống đại học ở Nhật Bản rất khác với cuộc sống thời trung học. "
+        "Tôi nghĩ cần phải thử những điều mới. Đó là ý kiến của tôi."
+    )
+    assert segments == 4
+    stage1 = [s for c in model.calls[:1] for s in c["sources"]]
+    assert all(s in PIVOT_JA_EN for s in stage1) and len(stage1) == 3
+    # Stage 2 gets English only; the 2-sentence English output is packed as one unit.
+    stage2 = [s for c in model.calls[1:] for s in c["sources"]]
+    assert sorted(stage2) == sorted(PIVOT_EN_VI)
+
+
+def test_pivot_empty_intermediate_falls_back_to_direct(caplog):
+    engine, model = make_engine(pivot_model)
+    out, _ = engine.translate(
+        text="知らない文です。", target_language="vi", num_beams=1, pivot_language="en"
+    )
+    assert out == "[direct 知らない文です。]"
+    assert "translating them directly" in caplog.text
+
+
+def test_pivot_number_only_intermediate_is_copied():
+    engine, model = make_engine(pivot_model)
+    out, _ = engine.translate(text="２０２４年。", target_language="vi", num_beams=1, pivot_language="en")
+    assert out == "2024."
+    assert len(model.calls) == 1  # nothing left to translate after stage 1
+
+
+def test_no_pivot_by_default_is_direct():
+    engine, model = make_engine(pivot_model)
+    out, _ = engine.translate(text="日本の大学生活は、高校までの生活とは大きく違います。", target_language="vi", num_beams=1)
+    assert out.startswith("[direct ")
+    assert not any(s in PIVOT_EN_VI for c in model.calls for s in c["sources"])
+
+
+def test_last_pivot_reports_only_a_pivot_that_ran():
+    engine, model = make_engine(pivot_model)
+    engine._translate_short = lambda text, **kw: "con mèo"
+    engine.translate(text="猫", target_language="vi", num_beams=1, pivot_language="en")
+    assert engine.last_pivot is None and not model.calls
+    engine.translate(text="日本の大学生活", target_language="vi", num_beams=1, pivot_language="en")
+    assert engine.last_pivot == "en"
+    engine.translate(text="知らない文です。", target_language="vi", num_beams=1, pivot_language="en")
+    assert engine.last_pivot is None  # empty intermediate: translated directly

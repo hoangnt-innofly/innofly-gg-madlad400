@@ -108,6 +108,15 @@
             <input type="number" name="max_new_tokens" value="512" min="16" max="1024" step="16" />
             <p class="hint">Đoạn dài thì tăng, tối đa 1024 / chunk.</p>
           </div>
+          <div>
+            <label>Dịch qua tiếng Anh</label>
+            <select name="pivot">
+              <option value="" selected>Tự động</option>
+              <option value="true">Bật</option>
+              <option value="false">Tắt</option>
+            </select>
+            <p class="hint">Tự động: cặp không có tiếng Anh (ja→vi…) dịch nguồn → en → đích, chính xác hơn, chậm ~2 lần.</p>
+          </div>
         </div>
       </details>
 
@@ -264,6 +273,7 @@
       countChars();
       statusEl.textContent = "Đang dịch… (chờ bản dịch trong cùng một request)";
       const data = new FormData(form);
+      if (!data.get("pivot")) data.delete("pivot");
       try {
         const res = await fetch("/api/v1/translate", { method: "POST", body: data, headers: apiHeaders() });
         const job = await res.json();
@@ -274,7 +284,8 @@
         statusEl.textContent =
           "Xong.\n" + job.source_language + " → " + job.target_language +
           (job.detected_language ? " · nhận diện " + job.detected_language : "") +
-          (job.chunks ? " · " + job.chunks + " đoạn" : "");
+          (job.chunks ? " · " + job.chunks + " đoạn" : "") +
+          (job.pivot_language ? " · qua " + job.pivot_language : "");
       } catch (err) {
         statusEl.textContent = "Lỗi: " + err.message;
       } finally {

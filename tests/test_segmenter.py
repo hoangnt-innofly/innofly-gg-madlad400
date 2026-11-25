@@ -349,3 +349,78 @@ def test_hard_split_at_a_spaced_dash(token_len):
     pieces = hard_split(text, token_len, 60)
     assert all(token_len(p) <= 60 for p in pieces)
     assert " ".join(pieces).split() == text.split()
+
+
+# The reported text: a title pasted on the same line as the paragraph, 2 spaces apart.
+UNIV = (
+    "テーマ：日本の大学生活  日本の大学生活は、高校までの生活とは大きく違います。"
+    "大学生になると、自分で授業を選び、時間割を作ることができます。"
+)
+
+
+def test_wide_gap_between_cjk_text_splits_a_title_from_its_paragraph(token_len):
+    units = split_text(UNIV, token_len=token_len, pack_tokens=256)
+    assert [(u.text, u.sep, u.label) for u in units] == [
+        ("テーマ", "：", True),
+        ("日本の大学生活", "  ", False),
+        ("日本の大学生活は、高校までの生活とは大きく違います。", "", False),
+        ("大学生になると、自分で授業を選び、時間割を作ることができます。", "", False),
+    ]
+    assert join_units(units, ["Chủ đề", "Tiêu đề", "Câu một.", "Câu hai."], "vi") == (
+        "Chủ đề: Tiêu đề  Câu một. Câu hai."
+    )
+    assert join_units(units, ["テーマ", "題", "文一。", "文二。"], "ja") == "テーマ：題  文一。文二。"
+
+
+@pytest.mark.parametrize(
+    "text, pieces",
+    [
+        ("山田　太郎です。", ["山田　太郎です。"]),  # one U+3000: a name, not a break
+        ("東京都 港区に住んでいます。", ["東京都 港区に住んでいます。"]),
+        ("第１章　　はじめに", ["第１章", "はじめに"]),
+        ("「はい」  「いいえ」", ["「はい」", "「いいえ」"]),
+        ("我的大学生活\t\t大学生活很有意思。", ["我的大学生活", "大学生活很有意思。"]),
+        ("Hello  world.", ["Hello  world."]),  # spaced scripts: a double space is a typo
+        ("我很好。  你呢？", ["我很好。", "你呢？"]),
+    ],
+)
+def test_wide_gap_split_only_between_han_kana(text, pieces, token_len):
+    assert [u.text for u in split_text(text, token_len=token_len)] == pieces
+
+
+def test_sentence_stop_followed_by_spaces_keeps_one_space(token_len):
+    units = split_text("我很好。  你呢？", token_len=token_len)
+    assert join_units(units, ["I am fine.", "And you?"], "en") == "I am fine. And you?"
+    units = split_text("第１章　　はじめに", token_len=token_len)
+    assert join_units(units, ["Chương 1", "Lời mở đầu"], "vi") == "Chương 1  Lời mở đầu"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "See figure (a)  (b) for details.",
+        "Options [1]  [2] are available.",
+        "Use f(x)  (or g(x)) here.",
+        "「東京  大阪」に行った。",  # a gap inside a quote is not a break
+        "彼は「おはよう  ございます」と言った。",
+    ],
+)
+def test_gap_needs_han_kana_on_both_sides_outside_brackets(text, token_len):
+    units = split_text(text, token_len=token_len)
+    assert [u.text for u in units] == [text] and units[0].whole_line
+
+
+def test_gap_before_a_heading_label_splits_it_off(token_len):
+    units = split_text("目次  第１章：はじめに", token_len=token_len)
+    assert [(u.text, u.sep, u.label) for u in units] == [
+        ("目次", "  ", False),
+        ("第１章", "：", True),
+        ("はじめに", "", False),
+    ]
+    assert join_units(units, ["Mục lục", "Chương 1", "Mở đầu"], "vi") == "Mục lục  Chương 1: Mở đầu"
+    units = split_text("・大学生活　　テーマ：大学", token_len=token_len)
+    assert [(u.text, u.lead, u.label) for u in units] == [
+        ("大学生活", "・", False),
+        ("テーマ", "", True),
+        ("大学", "", False),
+    ]

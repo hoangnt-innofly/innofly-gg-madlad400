@@ -13,6 +13,7 @@ from app.core.config import ROOT_DIR, Settings
 from app.core.languages import canonicalize_language, detect_language_info
 from app.services.glossary import Glossary
 from app.services.mock_engine import mock_translate
+from app.services.pivot import choose_pivot
 
 logger = logging.getLogger("madlad400-mt-api")
 
@@ -28,7 +29,10 @@ class Job:
     num_beams: int
     length_penalty: float
     max_new_tokens: int
+    # Request override for pivot translation (None = server rule, see pivot.choose_pivot).
+    pivot: bool | None = None
     status: JobStatus = "queued"
+    pivot_language: str | None = None  # the pivot actually used
     translation: str | None = None
     detected_language: str | None = None
     model_id: str = "google/madlad400-3b-mt"
@@ -52,6 +56,7 @@ class Job:
             "model": self.model_id,
             "mode": "mt",
             "num_beams": self.num_beams,
+            "pivot_language": self.pivot_language,
             "chunks": self.chunks,
             "error": self.error,
         }
@@ -91,6 +96,7 @@ class JobService:
         num_beams: int | None,
         length_penalty: float | None,
         max_new_tokens: int | None,
+        pivot: bool | None = None,
     ) -> Job:
         source = canonicalize_language(
             source_language or self.settings.mt_default_source_language,
@@ -114,6 +120,7 @@ class JobService:
                 self.settings.mt_default_max_new_tokens if max_new_tokens is None else max_new_tokens
             ),
             model_id=self.settings.mt_model_id,
+            pivot=pivot,
         )
         self.jobs[job_id] = job
         self._queue.put_nowait(job_id)
@@ -223,6 +230,14 @@ class JobService:
             job.progress = "glossary"
             return
 
+        # The pivot rule needs a trustworthy source: an unreliable guess ("kite" ->
+        # Finnish) would route plain English through English.
+        pivot_language = choose_pivot(
+            job.source_language if (explicit_source or reliable) else None,
+            job.target_language,
+            requested=job.pivot,
+        )
+
         if self.settings.mt_mock:
             job.translation = mock_translate(job.text, target_language=job.target_language)
             job.chunks = 1
@@ -239,7 +254,11 @@ class JobService:
             num_beams=job.num_beams,
             length_penalty=job.length_penalty,
             max_new_tokens=job.max_new_tokens,
+            pivot_language=pivot_language,
         )
+        # Report the pivot only if a unit really went through it (not for glossary hits
+        # or short-text reranks, which stay direct).
+        job.pivot_language = getattr(engine, "last_pivot", None)
         job.translation = translation
         job.chunks = chunks
 

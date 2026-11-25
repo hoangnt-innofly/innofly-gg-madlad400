@@ -104,10 +104,13 @@ async def translate(
     num_beams: Annotated[Optional[int], Form()] = None,
     length_penalty: Annotated[Optional[float], Form()] = None,
     max_new_tokens: Annotated[Optional[int], Form()] = None,
+    pivot: Annotated[Optional[bool], Form()] = None,
     wait: Annotated[bool, Form()] = True,
 ) -> JobResponse:
     """Machine translation with MADLAD-400 3B. Waits and returns translation."""
-    job = await _enqueue(text, source_language, target_language, num_beams, length_penalty, max_new_tokens)
+    job = await _enqueue(
+        text, source_language, target_language, num_beams, length_penalty, max_new_tokens, pivot
+    )
     if wait:
         job = await _await_job(job)
     return to_response(request, job)
@@ -122,9 +125,12 @@ async def create_job(
     num_beams: Annotated[Optional[int], Form()] = None,
     length_penalty: Annotated[Optional[float], Form()] = None,
     max_new_tokens: Annotated[Optional[int], Form()] = None,
+    pivot: Annotated[Optional[bool], Form()] = None,
 ) -> JobResponse:
     """Same as /translate: wait until done, then return translation."""
-    job = await _enqueue(text, source_language, target_language, num_beams, length_penalty, max_new_tokens)
+    job = await _enqueue(
+        text, source_language, target_language, num_beams, length_penalty, max_new_tokens, pivot
+    )
     job = await _await_job(job)
     return to_response(request, job)
 
@@ -144,6 +150,7 @@ async def _enqueue(
     num_beams: int | None,
     length_penalty: float | None,
     max_new_tokens: int | None,
+    pivot: bool | None = None,
 ):
     cleaned = (text or "").strip()
     if not cleaned:
@@ -176,4 +183,5 @@ async def _enqueue(
         num_beams=num_beams,
         length_penalty=length_penalty,
         max_new_tokens=max_new_tokens,
+        pivot=pivot,
     )
