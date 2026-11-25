@@ -15,7 +15,7 @@ import unicodedata
 
 logger = logging.getLogger("madlad400-mt-api")
 
-_EDGE_PUNCT = " \t\r\n\"'`“”‘’«»()[]{}"
+_EDGE_PUNCT = " \t\r\n\"'`“”‘’«»()[]{}　「」『』（）【】〈〉《》［］"
 _TRAILING_PUNCT = ".,;:!?…。！？、，；："
 _WORD = re.compile(r"\w+", re.UNICODE)
 # "Hi. Go" (Latin needs a space after the stop, so "U.S." / "3.5" stay short) or "好。走" (CJK).
