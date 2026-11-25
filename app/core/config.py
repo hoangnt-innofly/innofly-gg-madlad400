@@ -25,8 +25,8 @@ class Settings(BaseSettings):
     mt_model_id: str = "google/madlad400-3b-mt"
     mt_device_map: str = "cuda:0"
     mt_dtype: str = "bfloat16"
-    # After each job, park weights in RAM so the 12GB card is free for LTX/TTS/Comfy.
-    # Translate still runs on GPU. Set 0 only if MT owns the GPU.
+    # Unload the model from the GPU once no job is waiting, so the 12GB card is free for
+    # LTX/TTS/Comfy (the next request reloads it). Set 0 only if MT owns the GPU.
     mt_free_vram: bool = True
 
     mt_default_source_language: str = DEFAULT_SOURCE_LANGUAGE

@@ -2,26 +2,42 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.pivot import choose_pivot
+from app.services.pivot import route_unit
 
 
 @pytest.mark.parametrize(
-    "source, target, requested, expected",
+    "text, source, target, requested, expected",
     [
-        ("ja", "vi", None, "en"),
-        ("zh", "vi", None, "en"),
-        ("vi", "ja", None, "en"),
-        ("ja", "zh", None, "en"),
-        ("en", "vi", None, None),  # source is English
-        ("ja", "en", None, None),  # target is English
-        ("ja", "en", True, None),  # nothing to pivot through, even when forced
-        ("vi", "vi", None, None),
-        (None, "vi", None, None),  # unknown source: direct by default ...
-        ("auto", "vi", None, None),
-        (None, "vi", True, "en"),  # ... unless the request forces it
-        ("ja", "vi", False, None),
-        ("zh", "zh_Latn", None, None),
+        # Japanese / Chinese / Korean / Vietnamese units between two non-English languages
+        ("日本の大学生活は楽しいです。", "ja", "vi", None, "pivot"),
+        ("日本の大学生活は楽しいです。", None, "vi", None, "pivot"),  # own script is enough
+        ("我认为大学生应该找到平衡。", "zh", "vi", None, "pivot"),
+        ("저는 학생입니다.", "ko", "vi", None, "pivot"),
+        ("Tôi là sinh viên năm nhất.", "vi", "ja", None, "pivot"),
+        ("日本の大学生活は楽しいです。", "ja", "zh", None, "pivot"),
+        # Already in the target language: copied (Vietnamese needs Vietnamese-only letters)
+        ("Ghi chú: đây là câu ví dụ.", "ja", "vi", None, "copy"),
+        ("Ví dụ", "ja", "vi", True, "copy"),
+        ("休みの日に何をしますか。", "vi", "ja", None, "copy"),
+        ("저는 학생입니다.", "vi", "ko", None, "copy"),
+        ("Chữ 休 nghĩa là nghỉ ngơi.", "ja", "vi", None, "copy"),
+        ("Can you go to the bank", "ja", "vi", None, "direct"),  # English, not Vietnamese
+        ("我认为大学生应该找到平衡。", "ja", "zh", None, "direct"),  # Han only: zh->zh, not copied
+        # Latin text: English / romaji in a CJK document goes direct
+        ("Please read it twice.", "ja", "vi", None, "direct"),
+        ("Bonjour tout le monde.", "fr", "vi", None, "pivot"),  # Latin source: trust it
+        ("Bonjour tout le monde.", None, "vi", None, "direct"),  # unknown Latin: direct
+        # English on either side, or the request says no
+        ("Hello world.", "en", "vi", None, "direct"),
+        ("日本の大学生活は楽しいです。", "ja", "en", None, "direct"),
+        ("日本の大学生活は楽しいです。", "ja", "en", True, "direct"),
+        ("日本の大学生活は楽しいです。", "ja", "vi", False, "direct"),
+        ("Hello world.", None, "vi", True, "pivot"),
+        ("Tôi là sinh viên.", "auto", "vi", None, "copy"),  # accents + Vietnamese syllables
+        ("Ghi chú", "ja", "vi", None, "copy"),
+        ("Café de Paris été", "fr", "vi", None, "pivot"),  # accents, but not Vietnamese
     ],
 )
-def test_choose_pivot(source, target, requested, expected):
-    assert choose_pivot(source, target, requested=requested) == expected
+def test_route_unit(text, source, target, requested, expected):
+    got = route_unit(text, source_language=source, target_language=target, requested=requested)
+    assert got == expected

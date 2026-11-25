@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
 
 from app.core.auth import require_api_key
 from app.core.config import get_settings
@@ -35,11 +35,15 @@ def to_response(request: Request, job) -> JobResponse:
     return JobResponse.model_validate(job.to_public(public_base(request)))
 
 
-async def _await_job(job, timeout: float = 600):
+async def _await_job(job, response: Response, timeout: float = 600):
+    """Wait for ``job``. Still queued / running after ``timeout`` (a long text behind
+    other jobs): answer 202 with the job, whose ``job_id`` can be polled at
+    GET /api/v1/jobs/{job_id}, instead of a 504 that loses the running job."""
     try:
         job = await jobs.wait(job.id, timeout=timeout)
-    except (TimeoutError, asyncio.TimeoutError) as exc:
-        raise HTTPException(status_code=504, detail="Translation timed out") from exc
+    except (TimeoutError, asyncio.TimeoutError):
+        response.status_code = 202
+        return job
     if job.status == "failed":
         raise HTTPException(status_code=500, detail=job.error or "Translation failed")
     return job
@@ -98,6 +102,7 @@ def free_memory() -> dict:
 @api.post("/translate", response_model=JobResponse)
 async def translate(
     request: Request,
+    response: Response,
     text: Annotated[str, Form(min_length=1)],
     source_language: Annotated[Optional[str], Form()] = None,
     target_language: Annotated[Optional[str], Form()] = None,
@@ -112,13 +117,14 @@ async def translate(
         text, source_language, target_language, num_beams, length_penalty, max_new_tokens, pivot
     )
     if wait:
-        job = await _await_job(job)
+        job = await _await_job(job, response)
     return to_response(request, job)
 
 
 @api.post("/jobs", response_model=JobResponse)
 async def create_job(
     request: Request,
+    response: Response,
     text: Annotated[str, Form(min_length=1)],
     source_language: Annotated[Optional[str], Form()] = None,
     target_language: Annotated[Optional[str], Form()] = None,
@@ -131,7 +137,7 @@ async def create_job(
     job = await _enqueue(
         text, source_language, target_language, num_beams, length_penalty, max_new_tokens, pivot
     )
-    job = await _await_job(job)
+    job = await _await_job(job, response)
     return to_response(request, job)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -13,7 +14,6 @@ from app.core.config import ROOT_DIR, Settings
 from app.core.languages import canonicalize_language, detect_language_info
 from app.services.glossary import Glossary
 from app.services.mock_engine import mock_translate
-from app.services.pivot import choose_pivot
 
 logger = logging.getLogger("madlad400-mt-api")
 
@@ -33,6 +33,8 @@ class Job:
     pivot: bool | None = None
     status: JobStatus = "queued"
     pivot_language: str | None = None  # the pivot actually used
+    # Seconds spent in each phase (queue, load, translate), for the server log.
+    timings: dict[str, float] = field(default_factory=dict, repr=False)
     translation: str | None = None
     detected_language: str | None = None
     model_id: str = "google/madlad400-3b-mt"
@@ -69,6 +71,10 @@ class JobService:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._engine = None
         self._engine_lock = threading.Lock()
+        # Held while a job uses the engine: /free-memory must not unload the weights in
+        # the middle of generate(). A release asked for meanwhile runs after the job.
+        self._run_lock = threading.Lock()
+        self._release_pending = False
         self._worker_task: asyncio.Task | None = None
         glossary_path = (settings.mt_glossary_path or "").strip()
         if glossary_path and not Path(glossary_path).is_absolute():
@@ -106,6 +112,7 @@ class JobService:
             target_language or self.settings.mt_default_target_language,
             allow_auto=False,
         )
+        self._prune()
         job_id = uuid.uuid4().hex
         job = Job(
             id=job_id,
@@ -128,6 +135,20 @@ class JobService:
 
     def get(self, job_id: str) -> Job | None:
         return self.jobs.get(job_id)
+
+    def _prune(self) -> None:
+        """Forget finished jobs older than JOB_TTL_SECONDS (texts can be 20k characters)."""
+        ttl = self.settings.job_ttl_seconds
+        if ttl <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        expired = [
+            job_id
+            for job_id, job in self.jobs.items()
+            if job.finished_at is not None and (now - job.finished_at).total_seconds() > ttl
+        ]
+        for job_id in expired:
+            del self.jobs[job_id]
 
     async def wait(self, job_id: str, timeout: float = 600) -> Job:
         job = self.jobs[job_id]
@@ -153,13 +174,27 @@ class JobService:
             pass
 
     def free_vram(self) -> dict:
-        """Park MT weights off GPU so Comfy/LTX/TTS can use the 12GB card."""
+        """Unload MT weights from the GPU so Comfy/LTX/TTS can use the 12GB card.
+
+        While a job is translating, the release is deferred until it ends (unloading in
+        the middle of generate() would fail that job).
+        """
+        if not self._run_lock.acquire(blocking=False):
+            self._release_pending = True
+            return {"freed": False, "deferred": True}
+        try:
+            self._release()
+        finally:
+            self._run_lock.release()
+        return {"freed": True}
+
+    def _release(self) -> None:
+        self._release_pending = False
         with self._engine_lock:
             if self._engine is not None:
                 self._engine.release_vram()
             else:
                 self._free_cuda()
-        return {"freed": True}
 
     def cuda_info(self) -> tuple[bool, str | None]:
         try:
@@ -174,9 +209,13 @@ class JobService:
     async def _worker_loop(self) -> None:
         while True:
             job_id = await self._queue.get()
-            job = self.jobs[job_id]
+            job = self.jobs.get(job_id)
+            if job is None:  # pruned while queued (cannot happen with a sane TTL)
+                self._queue.task_done()
+                continue
             job.status = "running"
             job.progress = "starting"
+            job.timings["queue"] = (datetime.now(timezone.utc) - job.created_at).total_seconds()
             try:
                 await asyncio.to_thread(self._run_job, job)
                 job.status = "succeeded"
@@ -190,13 +229,30 @@ class JobService:
                     job.error = f"{exc} | {exc.__cause__}"
                 self._free_cuda()
             finally:
-                if self.settings.mt_free_vram:
+                # Unload only when no job is waiting: back-to-back requests would each
+                # pay the ~5 s reload otherwise.
+                if self._release_pending or (self.settings.mt_free_vram and self._queue.empty()):
                     self.free_vram()
                 job.finished_at = datetime.now(timezone.utc)
+                logger.info(
+                    "Job %s %s: %s -> %s, %d chars, chunks=%s, pivot=%s, %s",
+                    job.id[:8],
+                    job.status,
+                    job.source_language,
+                    job.target_language,
+                    len(job.text),
+                    job.chunks,
+                    job.pivot_language,
+                    ", ".join(f"{k} {v:.1f}s" for k, v in job.timings.items()),
+                )
                 job._done.set()
                 self._queue.task_done()
 
     def _run_job(self, job: Job) -> None:
+        with self._run_lock:
+            self._run_job_locked(job)
+
+    def _run_job_locked(self, job: Job) -> None:
         job.progress = "detecting_language"
         detected, reliable = detect_language_info(job.text)
         job.detected_language = detected
@@ -230,22 +286,17 @@ class JobService:
             job.progress = "glossary"
             return
 
-        # The pivot rule needs a trustworthy source: an unreliable guess ("kite" ->
-        # Finnish) would route plain English through English.
-        pivot_language = choose_pivot(
-            job.source_language if (explicit_source or reliable) else None,
-            job.target_language,
-            requested=job.pivot,
-        )
-
         if self.settings.mt_mock:
             job.translation = mock_translate(job.text, target_language=job.target_language)
             job.chunks = 1
             return
 
         job.progress = "loading_model"
+        t0 = time.perf_counter()
         engine = self._get_engine()
+        job.timings["load"] = time.perf_counter() - t0
         job.progress = "translating"
+        t0 = time.perf_counter()
         translation, chunks = engine.translate(
             text=job.text,
             target_language=job.target_language,
@@ -254,8 +305,12 @@ class JobService:
             num_beams=job.num_beams,
             length_penalty=job.length_penalty,
             max_new_tokens=job.max_new_tokens,
-            pivot_language=pivot_language,
+            pivot=job.pivot,
+            # Routing needs a trustworthy source: an unreliable guess ("kite" -> Finnish)
+            # would send plain English through English.
+            source_reliable=explicit_source or reliable,
         )
+        job.timings["translate"] = time.perf_counter() - t0
         # Report the pivot only if a unit really went through it (not for glossary hits
         # or short-text reranks, which stay direct).
         job.pivot_language = getattr(engine, "last_pivot", None)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from typing import Callable
 
 from app.services.generation import (
@@ -16,6 +17,7 @@ from app.services.generation import (
     severity,
     trim_loop,
 )
+from app.services.pivot import PIVOT_LANGUAGE, route_unit
 from app.services.segmenter import (
     Unit,
     count_sentences,
@@ -121,6 +123,7 @@ class MTEngine:
         dtype = self._resolve_dtype(torch, device)
         self._patch_t5_tied_weights()
 
+        load_started = time.perf_counter()
         logger.info(
             "Loading %s (transformers=%s, device=%s, dtype=%s, free_vram=%s)",
             self.model_id,
@@ -148,7 +151,8 @@ class MTEngine:
             self._assert_encoder_embeddings()
             self._ready = True
             logger.info(
-                "MADLAD-400 3B MT ready (%s) pad=%s eos=%s start=%s probe=%s",
+                "MADLAD-400 3B MT ready in %.1fs (%s) pad=%s eos=%s start=%s probe=%s",
+                time.perf_counter() - load_started,
                 self._vram_log(),
                 self.model.config.pad_token_id,
                 self.model.config.eos_token_id,
@@ -175,16 +179,21 @@ class MTEngine:
         length_penalty: float = 1.0,
         max_new_tokens: int = 512,
         lookup: Callable[[str], str | None] | None = None,
-        pivot_language: str | None = None,
+        pivot: bool | None = None,
+        source_reliable: bool = True,
     ) -> tuple[str, int]:
         """Translate ``text``; returns (translation, number of segments).
 
         ``source_language`` is optional (MADLAD only needs the target tag); when known it
         enables back-translation scoring for short input. ``lookup`` is a glossary hook
         tried on every line that was split, then on every unit, before the model.
-        ``pivot_language`` (see ``pivot.choose_pivot``): units decoded by the model go
-        source -> pivot -> target (``_translate_pivot``); glossary hits and the short-text
-        rerank are unchanged.
+        Every unit that reaches the model is routed on its own (``pivot.route_unit``):
+        copied when it is already written in the target (a Vietnamese note in a ja->vi
+        sheet), translated through English (``_translate_pivot``) when neither its
+        language nor the target is English, else directly. ``pivot`` is the request
+        override (True / False / None = rule); ``source_reliable`` False means
+        ``source_language`` is only a guess and is not used for routing. Glossary hits
+        and the short-text rerank are not routed (they stay direct).
 
         The text is cut into lines and sentences (``segmenter.split_text``): MADLAD is a
         sentence-level model and drops sentences, or writes new source-language text,
@@ -202,6 +211,7 @@ class MTEngine:
 
         import torch
 
+        started = time.perf_counter()
         units = self._segment(text, target_language)
         if not units:
             return "", 0
@@ -211,8 +221,20 @@ class MTEngine:
             self._lookup_lines(units, outputs, lookup)
         self.last_pivot = None
         rerank_lines = self._rerank_lines(units) if self.short_text_rerank else frozenset()
+        route_source = source_language if source_reliable else None
+        routes = {
+            i: route_unit(
+                unit.text,
+                source_language=route_source,
+                target_language=target_language,
+                requested=pivot,
+            )
+            for i, unit in enumerate(units)
+            if unit.translate
+        }
         pending: list[int] = []
         reranked = 0
+        copied = 0
         short_memo: dict[str, str] = {}
         try:
             with torch.no_grad():
@@ -227,6 +249,9 @@ class MTEngine:
                     hit = lookup(unit.text) if lookup else None
                     if hit is not None:
                         outputs[i] = hit
+                    elif routes[i] == "copy":
+                        outputs[i] = unit.text  # already in the target language
+                        copied += 1
                     elif unit.text in short_memo:
                         outputs[i] = short_memo[unit.text]
                     elif (
@@ -244,20 +269,21 @@ class MTEngine:
                         )
                     else:
                         pending.append(i)
-                if pending:
-                    decoding = dict(
-                        target_language=target_language,
-                        num_beams=num_beams,
-                        length_penalty=length_penalty,
-                        max_new_tokens=max_new_tokens,
-                    )
-                    if pivot_language:
-                        decoded = self._translate_pivot(
-                            [units[i] for i in pending], pivot_language=pivot_language, **decoding
-                        )
-                    else:
-                        decoded = self._translate_units([units[i] for i in pending], **decoding)
-                    for i, out in zip(pending, decoded):
+                decoding = dict(
+                    target_language=target_language,
+                    num_beams=num_beams,
+                    length_penalty=length_penalty,
+                    max_new_tokens=max_new_tokens,
+                )
+                direct = [i for i in pending if routes[i] != "pivot"]
+                via = [i for i in pending if routes[i] == "pivot"]
+                if via:
+                    decoded = self._translate_pivot([units[i] for i in via], **decoding)
+                    for i, out in zip(via, decoded):
+                        outputs[i] = out
+                if direct:
+                    decoded = self._translate_units([units[i] for i in direct], **decoding)
+                    for i, out in zip(direct, decoded):
                         outputs[i] = out
             if self.short_text_rerank and reranked >= self.short_text_max_units > 0:
                 logger.info(
@@ -265,12 +291,22 @@ class MTEngine:
                     "remaining short lines used plain decoding",
                     self.short_text_max_units,
                 )
+            logger.info(
+                "MT translate -> %s: %d units (%d glossary/rerank/symbols, %d already in "
+                "target, %d direct, %d via %s) in %.1fs",
+                target_language,
+                len(units),
+                len(units) - len(pending) - copied,
+                copied,
+                len(direct),
+                len(via),
+                PIVOT_LANGUAGE,
+                time.perf_counter() - started,
+            )
             return join_units(units, [o or "" for o in outputs], target_language), len(units)
         finally:
-            if self.free_vram:
-                self.release_vram()
-            else:
-                self._free_cuda()
+            # The job worker decides when to unload (only once its queue is empty).
+            self._free_cuda()
 
     def _translate_short(
         self,
@@ -411,6 +447,7 @@ class MTEngine:
         num_beams: int,
         length_penalty: float,
         max_new_tokens: int,
+        issues_out: list[frozenset[str]] | None = None,
     ) -> list[str]:
         """Decode units in padded batches, check every row, retry the bad ones once.
 
@@ -423,6 +460,8 @@ class MTEngine:
         * a packed unit (several spaced-script sentences) is re-translated sentence by
           sentence when its output has an issue, misses 2+ sentences, or is clearly too
           short for its source (``generation.pack_incomplete``).
+
+        ``issues_out``, when given, receives the issues each output still has.
         """
         texts = [unit.text for unit in units]
         first = self._translate_batch(
@@ -487,8 +526,10 @@ class MTEngine:
                     results[i], issues[i] = res, new_issues
 
         outputs: list[str] = []
+        final_issues: list[frozenset[str]] = []
         for i, res in enumerate(results):
             text = res.text
+            final_issues.append(frozenset() if i in fallback else issues[i])
             if i not in fallback and issues[i]:
                 if {"loop", "truncated"} <= issues[i]:
                     text = trim_loop(text)
@@ -508,25 +549,29 @@ class MTEngine:
             logger.info(
                 "MT pack fallback: %d packed units -> %d sentences", len(fallback), len(parts)
             )
+            part_issues: list[frozenset[str]] = []
             decoded = self._translate_units(
                 parts,
                 target_language=target_language,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
                 max_new_tokens=max_new_tokens,
+                issues_out=part_issues,
             )
             pos = 0
             for i in fallback:
                 n = len(units[i].parts)
                 outputs[i] = join_units(list(units[i].parts), decoded[pos : pos + n], target_language)
+                final_issues[i] = frozenset().union(*part_issues[pos : pos + n])
                 pos += n
+        if issues_out is not None:
+            issues_out.extend(final_issues)
         return outputs
 
     def _translate_pivot(
         self,
         units: list[Unit],
         *,
-        pivot_language: str,
         target_language: str,
         num_beams: int,
         length_penalty: float,
@@ -539,15 +584,35 @@ class MTEngine:
         then segmented like a request in the pivot language (sentences, packs, long
         pieces), all of them are decoded into the target in one batched pass, and each
         unit's pieces are joined back. A unit whose intermediate came back empty is
-        translated directly.
+        translated directly, and so is one whose English is still flagged after the
+        retries (cut off, looping, wrong script, far too short): the second stage would
+        only carry the loss on, and at 4+ beams ``_translate_units`` does not retry a
+        "short" / "script" row.
         """
+        pivot_language = PIVOT_LANGUAGE
+        started = time.perf_counter()
         decoding = dict(num_beams=num_beams, length_penalty=length_penalty, max_new_tokens=max_new_tokens)
-        middle = self._translate_units(units, target_language=pivot_language, **decoding)
+        stage1_issues: list[frozenset[str]] = []
+        middle = self._translate_units(
+            units, target_language=pivot_language, issues_out=stage1_issues, **decoding
+        )
+        stage1_time = time.perf_counter() - started
 
         stage: list[Unit] = []
         spans: list[tuple[int, int] | None] = []
         direct: list[int] = []
         for i, mid in enumerate(middle):
+            if stage1_issues[i]:
+                logger.info(
+                    "MT pivot: %s step still %s, translating directly: %r -> %r",
+                    pivot_language,
+                    sorted(stage1_issues[i]),
+                    units[i].text[:60],
+                    mid[:60],
+                )
+                direct.append(i)
+                spans.append(None)
+                continue
             sub = self._segment(mid, target_language) if mid.strip() else []
             if not sub:
                 direct.append(i)
@@ -569,6 +634,7 @@ class MTEngine:
 
         if len(direct) < len(units):
             self.last_pivot = pivot_language
+        stage2_time = time.perf_counter() - started - stage1_time
         outputs: list[str] = []
         for i, span in enumerate(spans):
             if span is None:
@@ -579,9 +645,10 @@ class MTEngine:
             logger.debug("MT pivot %r -> %r -> %r", units[i].text[:60], middle[i][:60], outputs[-1][:60])
         if direct:
             logger.warning(
-                "MT pivot (%s) gave no text for %d units; translating them directly",
+                "MT pivot (%s): %d of %d units translated directly instead",
                 pivot_language,
                 len(direct),
+                len(units),
             )
             for i, out in zip(
                 direct,
@@ -591,12 +658,16 @@ class MTEngine:
             ):
                 outputs[i] = out
         logger.info(
-            "MT pivot via %s: %d units -> %d %s pieces -> %s",
+            "MT pivot via %s: %d units -> %d %s pieces -> %s (stage 1 %.1fs, stage 2 %.1fs, "
+            "direct fallback %.1fs)",
             pivot_language,
             len(units),
             len(stage),
             pivot_language,
             target_language,
+            stage1_time,
+            stage2_time,
+            time.perf_counter() - started - stage1_time - stage2_time,
         )
         return outputs
 

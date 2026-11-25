@@ -194,14 +194,16 @@ def detect_language_info(text: str) -> tuple[str, bool]:
     words = _WORD.findall(sample[:4000])
     long_enough = len(words) >= MIN_RELIABLE_WORDS
 
-    script = _detect_script(sample[:4000])
+    script, decisive = script_language(sample[:4000])
     if script:
         if script != "vi":
-            return script, True
+            # Mixed scripts (a Vietnamese note quoting Japanese, a Japanese text with
+            # many English terms): a guess, never a reason to skip translation.
+            return script, decisive
         # á/à/é/ã… also occur in French/Spanish/Portuguese ("café", "été"): trust short
         # text only with Vietnamese-only letters or when every word is a Vietnamese syllable
         # ("nhà", "mèo", "cà phê").
-        reliable = (
+        reliable = decisive and (
             long_enough
             or bool(_VI_ONLY_CHARS.search(sample))
             or (bool(words) and all(_is_vi_syllable(w) for w in words))
@@ -246,27 +248,78 @@ def _is_vi_syllable(word: str) -> bool:
     return _VI_SYLLABLE.fullmatch(base) is not None
 
 
+# Scripts counted by _script_shares, in tie-break order. A Han / Kana / Hangul character
+# carries about as much text as a 3-letter Latin word piece, so it weighs 3.
+_SCRIPTS: tuple[tuple[str, re.Pattern[str], int], ...] = (
+    ("hangul", re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]"), 3),
+    ("kana", re.compile(r"[぀-ヿㇰ-ㇿｦ-ﾟ]"), 3),
+    ("han", re.compile(r"[㐀-䶿一-鿿豈-﫿]"), 3),
+    ("th", re.compile(r"[฀-๿]"), 1),
+    ("ar", re.compile(r"[؀-ۿ]"), 1),
+    ("ru", re.compile(r"[Ѐ-ӿ]"), 1),
+    ("hi", re.compile(r"[ऀ-ॿ]"), 1),
+    ("km", re.compile(r"[ក-៿]"), 1),
+    ("lo", re.compile(r"[຀-໿]"), 1),
+    ("my", re.compile(r"[က-႟]"), 1),
+    ("latin", re.compile(r"[A-Za-zÀ-ɏḀ-ỿ]"), 1),
+)
+# Below this share of the weighted letters the top script is not decisive (mixed text).
+DECISIVE_SHARE = 0.75
+# Han/kana/Hangul share above which Latin-majority text without Vietnamese letters is
+# read as CJK text with English terms.
+ASIAN_IN_LATIN_SHARE = 0.35
+
+
+def _script_shares(sample: str) -> dict[str, float]:
+    weights = {name: len(rx.findall(sample)) * w for name, rx, w in _SCRIPTS}
+    # Japanese Han and kana are one writing system: judge them together.
+    weights["cjk"] = weights.pop("kana") + weights.pop("han")
+    total = sum(weights.values())
+    return {k: v / total for k, v in weights.items() if v} if total else {}
+
+
+def script_language(sample: str) -> tuple[str | None, bool]:
+    """(language suggested by the dominant script, is that script decisive).
+
+    The dominant script wins by weighted share, not by the first character found: a
+    Vietnamese sentence quoting 休み is Vietnamese, a Japanese sentence with "Python" is
+    Japanese. Han/kana text is ja when it has any kana, else zh. Latin text is vi only
+    with Vietnamese letters, else None (left to langdetect). ``decisive`` is False when
+    another script holds more than ``1 - DECISIVE_SHARE`` of the text.
+    """
+    shares = _script_shares(sample)
+    if not shares:
+        return None, False
+    top = max(shares, key=lambda k: shares[k])
+    decisive = shares[top] >= DECISIVE_SHARE
+    if top == "latin" and not _VI_CHARS.search(sample):
+        # English terms inside CJK text ("React Hooksのuseeffectについて"): Latin letters
+        # outnumber the kana, but English prose quoting a word ("He is a 先生") keeps
+        # the CJK share low.
+        asian = max(("cjk", "hangul"), key=lambda k: shares.get(k, 0.0))
+        if shares.get(asian, 0.0) >= ASIAN_IN_LATIN_SHARE:
+            top, decisive = asian, False
+    if top == "cjk":
+        kana = _SCRIPTS[1][1]
+        return ("ja" if kana.search(sample) else "zh"), decisive
+    if top == "hangul":
+        return "ko", decisive
+    if top == "latin":
+        return ("vi" if _VI_CHARS.search(sample) else None), decisive
+    return top, decisive
+
+
+def looks_vietnamese(text: str) -> bool:
+    """Written in Vietnamese beyond doubt: a Vietnamese-only letter (ơ, ư, đ, ạ ...), or
+    Vietnamese accents on words that are all Vietnamese syllables ("Ghi chú", "Tôi là
+    sinh viên"). Plain ASCII never counts ("can you go" parses as syllables too)."""
+    if _VI_ONLY_CHARS.search(text):
+        return True
+    words = _WORD.findall(text)
+    return bool(_VI_CHARS.search(text)) and bool(words) and all(
+        w.isdigit() or _is_vi_syllable(w) for w in words
+    )
+
+
 def _detect_script(sample: str) -> str | None:
-    if re.search(r"[\uac00-\ud7a3]", sample):
-        return "ko"
-    if re.search(r"[\u3040-\u30ff]", sample):
-        return "ja"
-    if re.search(r"[\u4e00-\u9fff]", sample):
-        return "zh"
-    if re.search(r"[\u0e00-\u0e7f]", sample):
-        return "th"
-    if re.search(r"[\u0600-\u06ff]", sample):
-        return "ar"
-    if re.search(r"[\u0400-\u04ff]", sample):
-        return "ru"
-    if re.search(r"[\u0900-\u097f]", sample):
-        return "hi"
-    if re.search(r"[\u1780-\u17ff]", sample):
-        return "km"
-    if re.search(r"[\u0e80-\u0eff]", sample):
-        return "lo"
-    if re.search(r"[\u1000-\u109f]", sample):
-        return "my"
-    if _VI_CHARS.search(sample):
-        return "vi"
-    return None
+    return script_language(sample)[0]

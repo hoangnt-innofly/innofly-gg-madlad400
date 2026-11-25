@@ -173,7 +173,7 @@ GLOSSARY_JA_VI = {"テーマ": "Chủ đề"}
 def test_bug_paragraph_ja_vi_keeps_every_sentence(para_ja):
     engine, model = make_engine(sentence_level_ja_vi)
     engine._translate_short = lambda text, **kw: pytest.fail(f"glossary label reranked: {text}")
-    out, segments = engine.translate(
+    out, segments = engine.translate(pivot=False, 
         text=para_ja, target_language="vi", num_beams=1, lookup=GLOSSARY_JA_VI.get
     )
     values = list(JA_VI.values())
@@ -193,7 +193,7 @@ def test_bug_paragraph_ja_zh_joins_without_spaces(para_ja):
     zh["テーマ"] = "主题"
     zh["環境問題と私たちの生活"] = "环境问题与我们的生活"
     engine, _ = make_engine(lambda s, t, kw: zh[s], short_text_rerank=False)
-    out, _ = engine.translate(text=para_ja, target_language="zh", num_beams=1)
+    out, _ = engine.translate(pivot=False, text=para_ja, target_language="zh", num_beams=1)
     assert out == "主题：环境问题与我们的生活\n" + "".join(f"句{i}。" for i in range(1, 8))
 
 
@@ -201,7 +201,7 @@ def test_label_without_glossary_is_reranked_alone():
     engine, model = make_engine(lambda s, t, kw: {"the meeting is moved.": "cuộc họp bị dời."}[s])
     shorts: list[str] = []
     engine._translate_short = lambda text, **kw: shorts.append(text) or "Lưu ý"
-    out, segments = engine.translate(text="Note: the meeting is moved.", target_language="vi", num_beams=1)
+    out, segments = engine.translate(pivot=False, text="Note: the meeting is moved.", target_language="vi", num_beams=1)
     assert shorts == ["Note"] and segments == 2
     assert out == "Lưu ý: cuộc họp bị dời."
     assert model.calls[0]["sources"] == ["the meeting is moved."]
@@ -219,7 +219,7 @@ def test_truncated_row_is_retried_with_a_larger_budget():
 
     engine, model = make_engine(fn)
     text = "Please write a long answer."  # 6 content tokens
-    out, _ = engine.translate(text=text, target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text=text, target_language="vi", num_beams=1)
     assert out == long_answer
     assert [c["max_new_tokens"] for c in model.calls] == [64, 4 * 6 + 64]
 
@@ -227,7 +227,7 @@ def test_truncated_row_is_retried_with_a_larger_budget():
 def test_truncated_row_without_room_is_kept_and_logged(caplog):
     engine, model = make_engine(lambda s, t, kw: " ".join(WORDS[:70]))
     text = "Please write a long answer."
-    out, _ = engine.translate(text=text, target_language="vi", num_beams=1, max_new_tokens=40)
+    out, _ = engine.translate(pivot=False, text=text, target_language="vi", num_beams=1, max_new_tokens=40)
     assert len(model.calls) == 1 and out == " ".join(WORDS[:40])
     assert "still ['truncated']" in caplog.text
 
@@ -239,14 +239,14 @@ def test_repetition_loop_is_retried_with_beams_and_ngram_block():
         return "Bảo vệ " + "môi trường " * 40
 
     engine, model = make_engine(fn)
-    out, _ = engine.translate(text="環境を守る。", target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="環境を守る。", target_language="vi", num_beams=1)
     assert out == "Bảo vệ môi trường."
     assert model.calls[1]["num_beams"] == 4 and model.calls[1]["no_repeat_ngram_size"] == 4
 
 
 def test_persistent_loop_is_trimmed():
     engine, _ = make_engine(lambda s, t, kw: "Bảo vệ. " + "môi trường " * 80)
-    out, _ = engine.translate(text="環境を守る。", target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="環境を守る。", target_language="vi", num_beams=1)
     assert out == "Bảo vệ. môi trường"
 
 
@@ -257,7 +257,7 @@ def test_wrong_script_output_is_retried_with_beams():
         return "環境問題とは、地球の環境に悪影響を及ぼすものです。"
 
     engine, model = make_engine(fn)
-    out, _ = engine.translate(text="環境問題とは何ですか？", target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="環境問題とは何ですか？", target_language="vi", num_beams=1)
     assert out == "Vấn đề môi trường là gì?"
     assert len(model.calls) == 2
 
@@ -265,7 +265,7 @@ def test_wrong_script_output_is_retried_with_beams():
 def test_wrong_script_is_not_retried_with_the_same_beams(caplog):
     """At 4+ beams the "beam" retry would repeat the first search exactly."""
     engine, model = make_engine(lambda s, t, kw: "Tôi thích アニメ và マンガ lắm.")
-    out, _ = engine.translate(text="アニメとマンガが大好きです。", target_language="vi")
+    out, _ = engine.translate(pivot=False, text="アニメとマンガが大好きです。", target_language="vi")
     assert len(model.calls) == 1 and model.calls[0]["num_beams"] == 4
     assert out == "Tôi thích アニメ và マンガ lắm."
     assert "still ['script']" in caplog.text
@@ -278,13 +278,13 @@ def test_faithful_repetition_is_not_a_loop():
         return "Cố lên, cố lên, cố lên, cố lên!"
 
     engine, model = make_engine(fn)
-    out, _ = engine.translate(text="頑張れ頑張れ頑張れ頑張れ！", target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="頑張れ頑張れ頑張れ頑張れ！", target_language="vi", num_beams=1)
     assert out == "Cố lên, cố lên, cố lên, cố lên!" and len(model.calls) == 1
 
 
 def test_retry_that_is_not_better_keeps_the_first_output():
     engine, model = make_engine(lambda s, t, kw: "環境問題です。")
-    out, _ = engine.translate(text="環境問題とは何ですか？", target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="環境問題とは何ですか？", target_language="vi", num_beams=1)
     assert out == "環境問題です。" and len(model.calls) == 2
 
 
@@ -302,7 +302,7 @@ def test_pack_with_dropped_sentence_falls_back_to_sentences():
         return "Bầu trời màu xanh. Chúng tôi thích nó."  # dropped the middle sentence
 
     engine, model = make_engine(fn)
-    out, segments = engine.translate(
+    out, segments = engine.translate(pivot=False, 
         text="The sky is blue. The sea is wide. We like it.", target_language="vi", num_beams=1
     )
     assert out == "Bầu trời màu xanh. Biển rộng. Chúng tôi thích nó."
@@ -314,7 +314,7 @@ def test_pack_merged_in_target_is_kept():
     """One sentence short by count but full length: two sentences joined in the target."""
     merged = "Bầu trời màu xanh và biển thì rộng. Chúng tôi thích nó."
     engine, model = make_engine(lambda s, t, kw: merged)
-    out, _ = engine.translate(
+    out, _ = engine.translate(pivot=False, 
         text="The sky is blue. The sea is wide. We like it.", target_language="vi", num_beams=1
     )
     assert out == merged and len(model.calls) == 1
@@ -327,7 +327,7 @@ def test_pack_missing_two_sentences_falls_back():
         return "Bầu trời màu xanh, biển rộng và chúng tôi thích nó lắm lắm."  # 1 sentence for 3
 
     engine, model = make_engine(fn)
-    out, _ = engine.translate(
+    out, _ = engine.translate(pivot=False, 
         text="The sky is blue. The sea is wide. We like it.", target_language="vi", num_beams=1
     )
     assert out == "Bầu trời màu xanh. Biển rộng. Chúng tôi thích nó."
@@ -338,7 +338,7 @@ def test_complete_pack_is_one_call():
     engine, model = make_engine(
         lambda s, t, kw: " ".join(EN_VI[x.strip()] for x in re.findall(r"[^.]+\.", s))
     )
-    out, _ = engine.translate(
+    out, _ = engine.translate(pivot=False, 
         text="The sky is blue. The sea is wide. We like it.", target_language="vi", num_beams=1
     )
     assert out == "Bầu trời màu xanh. Biển rộng. Chúng tôi thích nó."
@@ -347,7 +347,7 @@ def test_complete_pack_is_one_call():
 
 def test_thai_target_never_packs():
     engine, model = make_engine(lambda s, t, kw: "ท" + s)
-    engine.translate(text="The sky is blue. The sea is wide.", target_language="th", num_beams=1)
+    engine.translate(pivot=False, text="The sky is blue. The sea is wide.", target_language="th", num_beams=1)
     assert sorted(model.calls[0]["sources"]) == ["The sea is wide.", "The sky is blue."]
 
 
@@ -365,7 +365,7 @@ def _rerank_engine(answers: dict[str, str]):
 
 def test_short_text_rerank_only_for_whole_lines():
     engine, _, shorts = _rerank_engine({"次。": "Tiếp.", "それだ。": "Đó."})
-    out, segments = engine.translate(text="kite\n\n次。それだ。", target_language="vi", num_beams=1)
+    out, segments = engine.translate(pivot=False, text="kite\n\n次。それだ。", target_language="vi", num_beams=1)
     assert shorts == ["kite"]  # a paragraph of its own; "次。" inside a line is not
     assert out == "<kite>\n\nTiếp. Đó."
     assert segments == 3
@@ -373,11 +373,11 @@ def test_short_text_rerank_only_for_whole_lines():
 
 def test_short_text_rerank_word_list_and_single_line():
     engine, model, shorts = _rerank_engine({})
-    out, _ = engine.translate(text="kite\ncape\nkit", target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="kite\ncape\nkit", target_language="vi", num_beams=1)
     assert shorts == ["kite", "cape", "kit"] and not model.calls
     assert out == "<kite>\n<cape>\n<kit>"
     engine, _, shorts = _rerank_engine({})
-    engine.translate(text="kite", target_language="vi", num_beams=1)
+    engine.translate(pivot=False, text="kite", target_language="vi", num_beams=1)
     assert shorts == ["kite"]
 
 
@@ -390,12 +390,12 @@ def test_short_lines_of_a_letter_are_not_reranked():
     }
     engine, _, shorts = _rerank_engine(answers)
     text = "Hi John,\nThanks for your message. I will send it.\nBest regards,\nAnna"
-    out, _ = engine.translate(text=text, target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text=text, target_language="vi", num_beams=1)
     assert shorts == []
     assert out == "\n".join(answers.values())
     # A short line next to a heading line of the same block is not a word list either.
     engine, _, shorts = _rerank_engine({"Hello": "Xin chào", "the meeting is moved.": "dời họp."})
-    engine.translate(text="Hello\nNote: the meeting is moved.", target_language="vi", num_beams=1)
+    engine.translate(pivot=False, text="Hello\nNote: the meeting is moved.", target_language="vi", num_beams=1)
     assert shorts == ["Note"]  # the label only
 
 
@@ -403,11 +403,11 @@ def test_short_heading_content_is_reranked():
     """'Word: kite' was reranked whole before headings were split: its lone content
     word must not fall back to plain decoding ('kite' -> 'đi đi')."""
     engine, model, shorts = _rerank_engine({})
-    out, _ = engine.translate(text="Word: kite", target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="Word: kite", target_language="vi", num_beams=1)
     assert shorts == ["Word", "kite"] and not model.calls
     assert out == "<Word>: <kite>"
     engine, model, shorts = _rerank_engine({})
-    out, _ = engine.translate(
+    out, _ = engine.translate(pivot=False, 
         text="テーマ：環境", target_language="vi", num_beams=1, lookup=GLOSSARY_JA_VI.get
     )
     assert shorts == ["環境"] and out == "Chủ đề: <環境>"
@@ -418,7 +418,7 @@ def test_dialogue_speaker_names_are_reranked_once():
                "そうですね。": "Đúng vậy."}
     engine, _, shorts = _rerank_engine(answers)
     text = "田中：おはようございます。\n佐藤：おはよう。今日は暑いね。\n田中：そうですね。"
-    out, _ = engine.translate(text=text, target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text=text, target_language="vi", num_beams=1)
     assert shorts == ["田中", "佐藤"]
     assert out == "<田中>: Chào buổi sáng.\n<佐藤>: Chào. Hôm nay nóng nhỉ.\n<田中>: Đúng vậy."
 
@@ -426,7 +426,7 @@ def test_dialogue_speaker_names_are_reranked_once():
 def test_bulleted_heading_label_gets_the_glossary():
     engine, model = make_engine(lambda s, t, kw: JA_VI[s])
     engine._translate_short = lambda text, **kw: pytest.fail(f"reranked: {text}")
-    out, _ = engine.translate(
+    out, _ = engine.translate(pivot=False, 
         text="・テーマ：環境問題と私たちの生活", target_language="vi", num_beams=1, lookup=GLOSSARY_JA_VI.get
     )
     assert out == "・Chủ đề: " + JA_VI["環境問題と私たちの生活"]
@@ -435,7 +435,7 @@ def test_bulleted_heading_label_gets_the_glossary():
 def test_glossary_matches_a_whole_split_line():
     engine, model = make_engine(lambda s, t, kw: pytest.fail("model must not run"))
     hits = {"おはよう。元気？": "Chào buổi sáng. Khỏe không?"}
-    out, _ = engine.translate(
+    out, _ = engine.translate(pivot=False, 
         text="おはよう。元気？", target_language="vi", num_beams=1, lookup=hits.get
     )
     assert out == "Chào buổi sáng. Khỏe không?"
@@ -443,14 +443,14 @@ def test_glossary_matches_a_whole_split_line():
 
 def test_symbols_are_copied_and_layout_kept():
     engine, _ = make_engine(lambda s, t, kw: "Xin chào.")
-    out, _ = engine.translate(text="★ 2024 ★\n\n　こんにちは。", target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="★ 2024 ★\n\n　こんにちは。", target_language="vi", num_beams=1)
     assert out == "★ 2024 ★\n\n　Xin chào."
 
 
 def test_oom_batch_is_halved():
     engine, model = make_engine(lambda s, t, kw: JA_VI[s], max_rows=2)
     sentences = list(JA_VI)[1:5]
-    out, _ = engine.translate(text="".join(sentences), target_language="vi", num_beams=1)
+    out, _ = engine.translate(pivot=False, text="".join(sentences), target_language="vi", num_beams=1)
     assert out == " ".join(JA_VI[s] for s in sentences)
     assert [len(c["sources"]) for c in model.calls] == [2, 2]
 
@@ -458,11 +458,11 @@ def test_oom_batch_is_halved():
 def test_batch_size_and_token_cap_are_respected():
     engine, model = make_engine(lambda s, t, kw: JA_VI[s], batch_size=3)
     sentences = list(JA_VI)[1:]
-    engine.translate(text="".join(sentences), target_language="vi", num_beams=1)
+    engine.translate(pivot=False, text="".join(sentences), target_language="vi", num_beams=1)
     assert [len(c["sources"]) for c in model.calls] == [3, 3, 1]
 
     engine, model = make_engine(lambda s, t, kw: JA_VI[s], batch_size=8, batch_max_tokens=200)
-    engine.translate(text="".join(sentences), target_language="vi", num_beams=4)
+    engine.translate(pivot=False, text="".join(sentences), target_language="vi", num_beams=4)
     assert all(len(c["sources"]) == 1 for c in model.calls)
     assert all(c["num_beams"] == 4 for c in model.calls)
 
@@ -498,7 +498,7 @@ def test_pivot_goes_through_english_and_keeps_layout():
     engine, model = make_engine(pivot_model)
     text = "テーマ：日本の大学生活  日本の大学生活は、高校までの生活とは大きく違います。私は、新しいことに挑戦することが必要だと思います。"
     out, segments = engine.translate(
-        text=text, target_language="vi", num_beams=1, lookup=GLOSSARY_JA_VI.get, pivot_language="en"
+        text=text, target_language="vi", num_beams=1, lookup=GLOSSARY_JA_VI.get, source_language="ja"
     )
     assert out == (
         "Chủ đề: Cuộc sống đại học ở Nhật Bản  "
@@ -516,22 +516,24 @@ def test_pivot_goes_through_english_and_keeps_layout():
 def test_pivot_empty_intermediate_falls_back_to_direct(caplog):
     engine, model = make_engine(pivot_model)
     out, _ = engine.translate(
-        text="知らない文です。", target_language="vi", num_beams=1, pivot_language="en"
+        text="知らない文です。", target_language="vi", num_beams=1, source_language="ja"
     )
     assert out == "[direct 知らない文です。]"
-    assert "translating them directly" in caplog.text
+    assert "translated directly instead" in caplog.text
 
 
 def test_pivot_number_only_intermediate_is_copied():
     engine, model = make_engine(pivot_model)
-    out, _ = engine.translate(text="２０２４年。", target_language="vi", num_beams=1, pivot_language="en")
+    out, _ = engine.translate(text="２０２４年。", target_language="vi", num_beams=1, source_language="ja")
     assert out == "2024."
     assert len(model.calls) == 1  # nothing left to translate after stage 1
 
 
-def test_no_pivot_by_default_is_direct():
+def test_pivot_false_is_direct():
     engine, model = make_engine(pivot_model)
-    out, _ = engine.translate(text="日本の大学生活は、高校までの生活とは大きく違います。", target_language="vi", num_beams=1)
+    out, _ = engine.translate(
+        text="日本の大学生活は、高校までの生活とは大きく違います。", target_language="vi", num_beams=1, pivot=False
+    )
     assert out.startswith("[direct ")
     assert not any(s in PIVOT_EN_VI for c in model.calls for s in c["sources"])
 
@@ -539,9 +541,61 @@ def test_no_pivot_by_default_is_direct():
 def test_last_pivot_reports_only_a_pivot_that_ran():
     engine, model = make_engine(pivot_model)
     engine._translate_short = lambda text, **kw: "con mèo"
-    engine.translate(text="猫", target_language="vi", num_beams=1, pivot_language="en")
+    engine.translate(text="猫", target_language="vi", num_beams=1, source_language="ja")
     assert engine.last_pivot is None and not model.calls
-    engine.translate(text="日本の大学生活", target_language="vi", num_beams=1, pivot_language="en")
+    engine.translate(text="日本の大学生活", target_language="vi", num_beams=1, source_language="ja")
     assert engine.last_pivot == "en"
-    engine.translate(text="知らない文です。", target_language="vi", num_beams=1, pivot_language="en")
+    engine.translate(text="知らない文です。", target_language="vi", num_beams=1, source_language="ja")
     assert engine.last_pivot is None  # empty intermediate: translated directly
+
+
+def test_pivot_is_chosen_per_unit_in_a_mixed_study_sheet():
+    """ja->vi sheet with Vietnamese notes and an English line: only Japanese goes via en."""
+    seen: list[tuple[str, str]] = []
+
+    def fn(source, target, kwargs):
+        seen.append((target, source))
+        if target == "en":
+            return PIVOT_JA_EN.get(source, "?")
+        return PIVOT_EN_VI.get(source, f"[{source}]")
+
+    engine, model = make_engine(fn, short_text_rerank=False)
+    text = (
+        "日本の大学生活\n"
+        "Ghi chú: đây là câu ví dụ của bài học.\n"
+        "Please read it twice before class."
+    )
+    out, _ = engine.translate(text=text, target_language="vi", num_beams=1, source_language="ja")
+    assert out.splitlines() == [
+        "Cuộc sống đại học ở Nhật Bản",
+        "Ghi chú: đây là câu ví dụ của bài học.",
+        "[Please read it twice before class.]",
+    ]
+    assert ("en", "日本の大学生活") in seen
+    assert not any("đây là" in src or "Ghi chú" in src for _, src in seen)  # copied, never decoded
+    assert ("vi", "Please read it twice before class.") in seen  # English line: direct
+    assert ("en", "Please read it twice before class.") not in seen
+
+
+def test_pivot_requested_on_unknown_source_and_mixed_routes():
+    engine, model = make_engine(pivot_model)
+    out, _ = engine.translate(
+        text="日本の大学生活", target_language="vi", num_beams=1, source_language="zh",
+        source_reliable=False, pivot=True,
+    )
+    assert out == "Cuộc sống đại học ở Nhật Bản" and engine.last_pivot == "en"
+
+
+def test_pivot_stage1_flagged_unit_is_translated_directly(caplog):
+    long_ja = "私は毎日学校へ行って友達と一緒に勉強しています。"  # 25 content tokens
+
+    def fn(source, target, kwargs):
+        if target == "en":
+            return "I."  # far too short: flagged "short" (not retried at 4 beams)
+        return f"[direct {source}]"
+
+    engine, model = make_engine(fn)
+    out, _ = engine.translate(text=long_ja, target_language="vi", num_beams=4, source_language="ja")
+    assert out == f"[direct {long_ja}]"
+    assert engine.last_pivot is None
+    assert "still ['short']" in caplog.text

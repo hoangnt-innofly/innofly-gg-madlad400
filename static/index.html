@@ -276,8 +276,16 @@
       if (!data.get("pivot")) data.delete("pivot");
       try {
         const res = await fetch("/api/v1/translate", { method: "POST", body: data, headers: apiHeaders() });
-        const job = await res.json();
+        let job = await res.json();
         if (!res.ok) throw new Error(job.detail || JSON.stringify(job));
+        // 202: still queued / running behind other jobs; poll until it ends.
+        while (job.status === "queued" || job.status === "running") {
+          statusEl.textContent = "Đang dịch… (" + (job.progress || job.status) + ")";
+          await new Promise((r) => setTimeout(r, 3000));
+          const poll = await fetch("/api/v1/jobs/" + job.job_id, { headers: apiHeaders() });
+          job = await poll.json();
+          if (!poll.ok) throw new Error(job.detail || JSON.stringify(job));
+        }
         if (job.status !== "succeeded") throw new Error(job.error || job.status);
         outEl.value = job.translation || "";
         countChars();

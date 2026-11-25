@@ -1,4 +1,4 @@
-"""When to translate through English (source -> en -> target).
+"""How each translation unit is routed: copied, translated directly, or through English.
 
 Pure python, no model needed.
 
@@ -8,38 +8,77 @@ Live ja->vi probes, sentence by sentence: the direct output invented content ("�
 and replaced the subject of "私は…と思います" with "các trường đại học", while ja->en was
 exact and en->vi of that English kept the meaning and the subject ("Tôi nghĩ…"). Over 12
 live pairs (ja/zh/ko/de/ru/th/fr->vi, vi->ja/zh/ko, ja<->zh) direct made 40 serious errors,
-the pivot 9; no pair was better direct, so the rule has no exceptions and no setting.
+the pivot 9 (fr->vi was a tie: no serious error either way).
+
+The route is decided per unit, from the unit's own script, not once per request: a
+ja->vi study sheet has Vietnamese explanation lines ("Ví dụ: …") that must be copied, not
+paraphrased through English, and English terms / romaji lines that need no English step.
 """
 
 from __future__ import annotations
 
+import re
+from typing import Literal
+
+from app.core.languages import looks_vietnamese, script_language
 from app.services.segmenter import target_base
 
 PIVOT_LANGUAGE = "en"
 
+Route = Literal["copy", "direct", "pivot"]
 
-def choose_pivot(
+# A unit counts as already written in the target only with evidence no other language
+# gives: Vietnamese letters / accented Vietnamese syllables (``looks_vietnamese``; plain
+# "can you go" never counts), kana, Hangul. Chinese is never assumed (Japanese kanji
+# look the same).
+_WRITTEN_IN = {
+    "vi": looks_vietnamese,
+    "ja": re.compile(r"[぀-ヿ]").search,
+    "ko": re.compile(r"[가-힣]").search,
+}
+# Sources not written in Latin script: a Latin unit inside such a document is English,
+# romaji or a code / product name, not the source language.
+_NON_LATIN_SOURCES = frozenset(
+    "ja zh yue ko th lo km my ar fa ur ps he yi ru uk bg sr mk be kk ky tg mn hi mr ne "
+    "bn as ta te kn ml gu pa or si ka hy am ti el bo dz".split()
+)
+
+
+def route_unit(
+    text: str,
+    *,
     source_language: str | None,
     target_language: str,
-    *,
     requested: bool | None = None,
-) -> str | None:
-    """``PIVOT_LANGUAGE``, or None for direct translation.
+) -> Route:
+    """Route one unit.
 
-    * ``requested`` False (form field ``pivot=false``): direct;
-    * the target is English: direct (nothing to pivot through);
-    * ``requested`` True: pivot whatever the source (also an unknown one);
-    * otherwise pivot only when the source is known and is neither English nor the
-      target language.
+    * ``copy``: the unit is decisively written in the target language (a Vietnamese
+      note in a ja->vi document), whatever ``requested`` says;
+    * ``direct``: ``requested`` is False, the target is English, or the unit's language
+      is unknown, English or the target itself;
+    * ``pivot``: ``requested`` is True, or the unit's language (its own script, else the
+      request's ``source_language`` for Latin text of a Latin-script source) is neither
+      English nor the target.
+
+    ``source_language`` must be a trustworthy request source (explicit or a reliable
+    detection), else None.
     """
-    if requested is False:
-        return None
     tgt = target_base(target_language)
-    if not tgt or tgt == PIVOT_LANGUAGE:
-        return None
-    if requested:
-        return PIVOT_LANGUAGE
     src = target_base(source_language or "")
-    if not src or src in ("auto", PIVOT_LANGUAGE, tgt):
-        return None
-    return PIVOT_LANGUAGE
+    if src == "auto":
+        src = ""
+    lang, decisive = script_language(text)
+    if lang == "vi" and not looks_vietnamese(text):
+        lang = None  # é / à / ô of French, Portuguese ...: Latin of unknown language
+    written = _WRITTEN_IN.get(tgt)
+    if decisive and lang == tgt and src != tgt and written is not None and written(text):
+        return "copy"
+    if requested is False or not tgt or tgt == PIVOT_LANGUAGE:
+        return "direct"
+    if requested:
+        return "pivot"
+    unit_src = lang or (src if src and src not in _NON_LATIN_SOURCES else "")
+    if not unit_src or unit_src in (PIVOT_LANGUAGE, tgt):
+        return "direct"
+    return "pivot"

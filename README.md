@@ -13,7 +13,7 @@ Submit source text + target language. One request waits and returns `translation
 | Languages | 400+; form lists common ones, any MADLAD ISO code is accepted |
 | Decode | Beam search (`num_beams=4`, `do_sample=false`) |
 | Long text | One model input per line / sentence (CJK split at 。！？ with no space needed), decoded in padded batches |
-| VRAM | ~6 GB BF16 while translating; released after each job (`MT_FREE_VRAM=1`) |
+| VRAM | ~6 GB BF16 while translating; released when the job queue is empty (`MT_FREE_VRAM=1`) |
 
 MADLAD only needs the **target** language tag (`<2vi>`, `<2en>`, `<2zh>`). Source language is optional and used for Auto-detect + skip-if-same-language.
 
@@ -26,7 +26,7 @@ MADLAD only needs the **target** language tag (`<2vi>`, `<2en>`, `<2zh>`). Sourc
 | `GET` | `/api/v1/jobs/{job_id}` | Optional lookup of a finished job |
 | `GET` | `/api/v1/languages` | Language list for the form |
 | `POST` | `/api/v1/detect` | Detect source language |
-| `POST` | `/api/v1/free-memory` | Park weights off GPU (same idea as Comfy `free_memory`) |
+| `POST` | `/api/v1/free-memory` | Unload weights from the GPU (same idea as Comfy `free_memory`); during a job it is deferred until the job ends (`{"freed": false, "deferred": true}`) |
 | `GET` | `/health` | CUDA / mock / defaults (no API key) |
 | `GET` | `/docs` | Swagger |
 
@@ -72,7 +72,9 @@ Multipart fields:
 }
 ```
 
-Jobs are serialized on one GPU worker so concurrent requests do not OOM.
+Jobs are serialized on one GPU worker so concurrent requests do not OOM. A request still queued or running after 600 s gets HTTP `202` with the job (`status` `queued` / `running`) instead of an error: poll `GET /api/v1/jobs/{job_id}`. Finished jobs are forgotten after `JOB_TTL_SECONDS`.
+
+Every job logs one line with its phases, e.g. `Job 1a2b3c4d succeeded: ja -> vi, 230 chars, chunks=7, pivot=en, queue 0.0s, load 5.1s, translate 3.2s` (pivot jobs also log stage 1 / stage 2 times). `load` is the model reload paid when the GPU was released.
 
 ## Setup (Windows + Python 3.12)
 
@@ -109,14 +111,14 @@ python scripts/download_models.py
 
 If you download weights locally, set `MT_MODEL_ID` to that folder, for example `models/madlad400-3b-mt`. Otherwise the Hugging Face id is used and weights download on first load.
 
-Port `8002` avoids colliding with TTS/LTX on `8000`. Keep `MT_FREE_VRAM=0` so the 3B model stays on GPU — a few lines should translate in ~1–3s after the first load. Set `1` only when this process must free the 12GB card for LTX/TTS after every job (each request then reloads ~6GB).
+Port `8002` avoids colliding with TTS/LTX on `8000`. `MT_FREE_VRAM=0` keeps the 3B model on the GPU (a few lines translate in ~1–3s after the first load). With `1` (shared 12GB card) the model is unloaded as soon as no job is waiting, so back-to-back requests load it once but a request after an idle gap reloads ~6GB.
 
 ## Quality notes
 
 - Greedy/sampling is worse than beam search for this model. Keep `do_sample` off.
 - `num_beams=4` matches the MADLAD examples; raise to 5–8 on the form if a sentence feels stiff.
 - Text is translated line by line and sentence by sentence (see *Segmentation and batching*): MADLAD drops sentences when several reach it as one input.
-- Auto-detect uses script heuristics (Vietnamese diacritics, CJK, Hangul, Thai, …) then `langdetect`. Under 4 words `langdetect` is noise (`kite` → Finnish, `cape` → Romanian), so short Latin text is treated as an unreliable English guess and is never skipped as "same language".
+- Auto-detect uses script heuristics (Vietnamese diacritics, CJK, Hangul, Thai, …) then `langdetect`. The dominant script wins by weighted share (a Han / kana / Hangul character weighs 3 letters), so `Từ 休み trong tiếng Nhật…` is Vietnamese and `Pythonでリスト…` Japanese; mixed text (no script at 75%+) is never "reliable", so it is never skipped as same-language. Under 4 words `langdetect` is noise (`kite` → Finnish, `cape` → Romanian), so short Latin text is treated as an unreliable English guess and is never skipped as "same language".
 
 ### Segmentation and batching
 
@@ -144,9 +146,15 @@ A retry is kept only if it is better; anything still wrong is logged (`MT output
 
 MADLAD-400 3B is strong into and out of English but weak between two other languages. Live ja→vi, sentence by sentence, the direct output invented content (`大学生になると、自分で授業を選び、時間割を作ることができます。` → `Sau khi tốt nghiệp, sinh viên có thể tự lựa chọn ngành học…`) and replaced the subject of `私は、…必要だと思います。` with `các trường đại học`; ja→en was exact and en→vi of that English kept meaning and subject (`Tôi nghĩ là cần thiết phải…`).
 
-So when the source language is known (explicit, or a reliable detection) and neither the source nor the target is English, every unit decoded by the model goes source → en → target (`app/services/pivot.py`, `MTEngine._translate_pivot`). Stage 1 runs with all the usual checks and retries; each English intermediate is then segmented like an English request (sentences, packs) and decoded into the target in one batched pass. Glossary hits and the short-text rerank are unchanged (still direct). Cost: about 2× decoding time. The response field `pivot_language` is the pivot that at least one unit really went through (`null` when everything was direct, a glossary hit or a short-text rerank).
+So every unit decoded by the model is routed on its own (`pivot.route_unit`), from its own script, not once per request:
 
-A request can force it with `pivot=true` / `pivot=false` (no environment variable: the rule is fixed in code; live probes over 12 pairs gave 40 serious errors direct vs 9 through English).
+- **copy**: already written in the target (`vi`: Vietnamese-only letters or accented Vietnamese syllables, `Ghi chú: đây là…`; `ja`: kana; `ko`: Hangul). A Vietnamese note in a ja→vi study sheet is kept, not paraphrased through English;
+- **pivot** source → en → target (`MTEngine._translate_pivot`): the unit's language (its script, else the request's trustworthy source for Latin text of a Latin-script source such as `fr`) is neither English nor the target;
+- **direct**: English target, English / romaji / unknown Latin units (an English line in a Japanese document), `pivot=false`.
+
+Stage 1 runs with all the usual checks and retries; a unit whose English is still flagged (cut off, looping, wrong script, far too short — not retried at 4 beams) is translated directly instead of carrying the loss on. Each English intermediate is segmented like an English request (sentences, packs) and decoded into the target in one batched pass. Glossary hits and the short-text rerank are unchanged (still direct). Cost: about 2× the decoding time of the pivoted units. The response field `pivot_language` is the pivot that at least one unit really went through (`null` when everything was direct, a glossary hit or a short-text rerank).
+
+A request can force it with `pivot=true` / `pivot=false` (no environment variable: the rule is fixed in code). Live probes, about 90 sentences over 12 pairs judged by hand: 40 serious errors direct vs 9 through English; fr→vi was a tie (no serious error either way, direct kept the casual register better).
 
 ### Single words / short phrases
 
